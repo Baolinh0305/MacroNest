@@ -1,0 +1,380 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
+#[cfg(windows)]
+mod windows_impl {
+    use windows::{
+        core::BOOL,
+        Win32::{
+            Foundation::{HWND, LPARAM, RECT},
+            Graphics::Gdi::{
+                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+                DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetWindowDC, HGDIOBJ, HALFTONE,
+                ReleaseDC, SRCCOPY, SelectObject, SetStretchBltMode, StretchBlt,
+            },
+            UI::WindowsAndMessaging::{
+                EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
+                GetWindowTextW, IsWindowVisible, PW_RENDERFULLCONTENT,
+            },
+            Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
+        },
+    };
+
+    #[derive(Debug, Clone)]
+    pub struct WindowInfo {
+        pub title: String,
+        pub selector: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct WindowPreviewFrame {
+        pub title: String,
+        pub logical_width: i32,
+        pub logical_height: i32,
+        pub width: usize,
+        pub height: usize,
+        pub rgba: Vec<u8>,
+    }
+
+    pub fn list_open_windows() -> Vec<WindowInfo> {
+        let mut windows: Vec<WindowInfo> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_window_proc),
+                LPARAM(&mut windows as *mut Vec<WindowInfo> as isize),
+            );
+        }
+        windows.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        windows
+    }
+
+    pub fn capture_window_preview(
+        title: Option<&str>,
+        max_dimension: u32,
+    ) -> Option<WindowPreviewFrame> {
+        let hwnd = find_window_handle(title)?;
+        unsafe { capture_window_preview_from_hwnd(hwnd, max_dimension.max(64)) }
+    }
+
+    unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return true.into();
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, &mut buffer);
+        if copied > 0 {
+            let title = String::from_utf16_lossy(&buffer[..copied as usize]).trim().to_owned();
+            if !title.is_empty() {
+                let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+                windows.push(WindowInfo {
+                    selector: window_selector(hwnd, &title),
+                    title,
+                });
+            }
+        }
+        true.into()
+    }
+
+    fn find_window_handle(title: Option<&str>) -> Option<HWND> {
+        if let Some(title_or_selector) = title {
+            let mut found = None;
+            unsafe {
+                let _ = EnumWindows(
+                    Some(find_exact_window_proc),
+                    LPARAM((&mut (title_or_selector, &mut found)) as *mut _ as isize),
+                );
+            }
+            found
+        } else {
+            let hwnd = unsafe { GetForegroundWindow() };
+            if hwnd.0.is_null() { None } else { Some(hwnd) }
+        }
+    }
+
+    unsafe extern "system" fn find_exact_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let (target_title, found) = &mut *(lparam.0 as *mut (&str, &mut Option<HWND>));
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        let Some(title) = window_title(hwnd) else {
+            return true.into();
+        };
+        if title == *target_title || window_selector(hwnd, &title) == *target_title {
+            **found = Some(hwnd);
+            return false.into();
+        }
+        true.into()
+    }
+
+    fn window_selector(hwnd: HWND, title: &str) -> String {
+        format!("{title} (0x{:X})", hwnd.0 as usize)
+    }
+
+    fn window_title(hwnd: HWND) -> Option<String> {
+        let length = unsafe { GetWindowTextLengthW(hwnd) };
+        if length <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+        if copied <= 0 {
+            return None;
+        }
+        let title = String::from_utf16_lossy(&buffer[..copied as usize])
+            .trim()
+            .to_owned();
+        if title.is_empty() { None } else { Some(title) }
+    }
+
+    unsafe fn capture_window_preview_from_hwnd(
+        hwnd: HWND,
+        max_dimension: u32,
+    ) -> Option<WindowPreviewFrame> {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return None;
+        }
+        let screen_width = (rect.right - rect.left).max(1);
+        let screen_height = (rect.bottom - rect.top).max(1);
+        let scale = (max_dimension as f32 / screen_width as f32)
+            .min(max_dimension as f32 / screen_height as f32)
+            .min(1.0);
+        let capture_width = ((screen_width as f32 * scale).round() as i32).max(1);
+        let capture_height = ((screen_height as f32 * scale).round() as i32).max(1);
+
+        let screen_dc = GetDC(None);
+        let window_dc = GetWindowDC(Some(hwnd));
+        if screen_dc.0.is_null() && window_dc.0.is_null() {
+            return None;
+        }
+        let compat_dc = if !screen_dc.0.is_null() {
+            screen_dc
+        } else {
+            window_dc
+        };
+
+        let full_dc = CreateCompatibleDC(Some(compat_dc));
+        if full_dc.0.is_null() {
+            if !screen_dc.0.is_null() {
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            if !window_dc.0.is_null() {
+                let _ = ReleaseDC(Some(hwnd), window_dc);
+            }
+            return None;
+        }
+        let scaled_dc = CreateCompatibleDC(Some(compat_dc));
+        if scaled_dc.0.is_null() {
+            let _ = DeleteDC(full_dc);
+            if !screen_dc.0.is_null() {
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            if !window_dc.0.is_null() {
+                let _ = ReleaseDC(Some(hwnd), window_dc);
+            }
+            return None;
+        }
+
+        let mut full_info = BITMAPINFO::default();
+        full_info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        full_info.bmiHeader.biWidth = screen_width;
+        full_info.bmiHeader.biHeight = -screen_height;
+        full_info.bmiHeader.biPlanes = 1;
+        full_info.bmiHeader.biBitCount = 32;
+        full_info.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut full_bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let full_bitmap = CreateDIBSection(
+            Some(compat_dc),
+            &full_info,
+            DIB_RGB_COLORS,
+            &mut full_bits,
+            None,
+            0,
+        )
+        .ok()?;
+        if full_bitmap.0.is_null() || full_bits.is_null() {
+            let _ = DeleteDC(full_dc);
+            let _ = DeleteDC(scaled_dc);
+            if !screen_dc.0.is_null() {
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            if !window_dc.0.is_null() {
+                let _ = ReleaseDC(Some(hwnd), window_dc);
+            }
+            return None;
+        }
+
+        let mut scaled_info = BITMAPINFO::default();
+        scaled_info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        scaled_info.bmiHeader.biWidth = capture_width;
+        scaled_info.bmiHeader.biHeight = -capture_height;
+        scaled_info.bmiHeader.biPlanes = 1;
+        scaled_info.bmiHeader.biBitCount = 32;
+        scaled_info.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut scaled_bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let scaled_bitmap = CreateDIBSection(
+            Some(compat_dc),
+            &scaled_info,
+            DIB_RGB_COLORS,
+            &mut scaled_bits,
+            None,
+            0,
+        )
+        .ok()?;
+        if scaled_bitmap.0.is_null() || scaled_bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(full_bitmap.0));
+            let _ = DeleteDC(full_dc);
+            let _ = DeleteDC(scaled_dc);
+            if !screen_dc.0.is_null() {
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            if !window_dc.0.is_null() {
+                let _ = ReleaseDC(Some(hwnd), window_dc);
+            }
+            return None;
+        }
+
+        let full_old_obj = SelectObject(full_dc, HGDIOBJ(full_bitmap.0));
+        let scaled_old_obj = SelectObject(scaled_dc, HGDIOBJ(scaled_bitmap.0));
+        let _ = SetStretchBltMode(full_dc, HALFTONE);
+        let _ = SetStretchBltMode(scaled_dc, HALFTONE);
+
+        let copied_full = if PrintWindow(hwnd, full_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool() {
+            true
+        } else if !window_dc.0.is_null() {
+            StretchBlt(
+                full_dc,
+                0,
+                0,
+                screen_width,
+                screen_height,
+                Some(window_dc),
+                0,
+                0,
+                screen_width,
+                screen_height,
+                SRCCOPY,
+            )
+            .as_bool()
+        } else if !screen_dc.0.is_null() {
+            StretchBlt(
+                full_dc,
+                0,
+                0,
+                screen_width,
+                screen_height,
+                Some(screen_dc),
+                rect.left,
+                rect.top,
+                screen_width,
+                screen_height,
+                SRCCOPY,
+            )
+            .as_bool()
+        } else {
+            false
+        };
+
+        let copied = if copied_full {
+            StretchBlt(
+                scaled_dc,
+                0,
+                0,
+                capture_width,
+                capture_height,
+                Some(full_dc),
+                0,
+                0,
+                screen_width,
+                screen_height,
+                SRCCOPY,
+            )
+            .as_bool()
+        } else {
+            false
+        };
+
+        let rgba = if copied {
+            let len = (capture_width as usize) * (capture_height as usize) * 4;
+            let pixels = std::slice::from_raw_parts(scaled_bits as *const u8, len);
+            let mut rgba = Vec::with_capacity(len);
+            for px in pixels.chunks_exact(4) {
+                rgba.push(px[2]);
+                rgba.push(px[1]);
+                rgba.push(px[0]);
+                rgba.push(255);
+            }
+            rgba
+        } else {
+            Vec::new()
+        };
+
+        let title = window_title(hwnd).unwrap_or_else(|| "Focused window".to_owned());
+
+        let _ = SelectObject(full_dc, full_old_obj);
+        let _ = SelectObject(scaled_dc, scaled_old_obj);
+        let _ = DeleteObject(HGDIOBJ(full_bitmap.0));
+        let _ = DeleteObject(HGDIOBJ(scaled_bitmap.0));
+        let _ = DeleteDC(full_dc);
+        let _ = DeleteDC(scaled_dc);
+        if !screen_dc.0.is_null() {
+            let _ = ReleaseDC(None, screen_dc);
+        }
+        if !window_dc.0.is_null() {
+            let _ = ReleaseDC(Some(hwnd), window_dc);
+        }
+
+        if !copied || rgba.is_empty() {
+            return None;
+        }
+
+        Some(WindowPreviewFrame {
+            title,
+            logical_width: screen_width,
+            logical_height: screen_height,
+            width: capture_width as usize,
+            height: capture_height as usize,
+            rgba,
+        })
+    }
+}
+
+#[cfg(windows)]
+pub use windows_impl::*;
+
+#[cfg(not(windows))]
+mod fallback {
+    #[derive(Debug, Clone)]
+    pub struct WindowInfo {
+        pub title: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct WindowPreviewFrame {
+        pub title: String,
+        pub logical_width: i32,
+        pub logical_height: i32,
+        pub width: usize,
+        pub height: usize,
+        pub rgba: Vec<u8>,
+    }
+
+    pub fn list_open_windows() -> Vec<WindowInfo> {
+        Vec::new()
+    }
+
+    pub fn capture_window_preview(
+        _title: Option<&str>,
+        _max_dimension: u32,
+    ) -> Option<WindowPreviewFrame> {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub use fallback::*;

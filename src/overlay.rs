@@ -1,0 +1,5191 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
+#[cfg(windows)]
+mod windows_overlay {
+    use std::{
+        collections::{HashMap, HashSet},
+        ffi::c_void,
+        mem::size_of,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use anyhow::{Context, Result, bail};
+    use crossbeam_channel::{Receiver, Sender};
+    use once_cell::sync::Lazy;
+    use parking_lot::Mutex;
+    use windows::{
+        Win32::{
+            Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+            Graphics::{
+                Dwm::{
+                    DWMWA_EXTENDED_FRAME_BOUNDS, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
+                    DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY,
+                    DWM_TNP_VISIBLE,
+                    DwmGetWindowAttribute, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+                    DwmUpdateThumbnailProperties,
+                },
+                Gdi::{
+                    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+                    BLENDFUNCTION, BeginPaint, CreateCompatibleDC, CreateDIBSection,
+                    CreateFontW, DIB_RGB_COLORS, DEFAULT_CHARSET, DeleteDC, DeleteObject,
+                    DrawTextW, EndPaint, FF_DONTCARE, FW_MEDIUM, GetDC, GetMonitorInfoW,
+                    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+                    OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode,
+                    SetTextColor, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DT_CENTER,
+                    DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+                },
+            },
+            System::{
+                LibraryLoader::GetModuleHandleW,
+                Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId},
+            },
+            UI::{
+                Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+                    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOD_ALT, MOD_CONTROL,
+                    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+                    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+                    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+                    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, RegisterHotKey, SendInput,
+                    SetActiveWindow, SetFocus, UnregisterHotKey, VIRTUAL_KEY,
+                },
+                Magnification::{
+                    MAGTRANSFORM, MS_SHOWMAGNIFIEDCURSOR, MagInitialize, MagSetWindowSource,
+                    MagSetWindowTransform, MagUninitialize, WC_MAGNIFIER,
+                },
+                Shell::{
+                    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+                    Shell_NotifyIconW,
+                },
+                WindowsAndMessaging::{
+                    AppendMenuW, BringWindowToTop, CREATESTRUCTW, CallNextHookEx,
+                    CreatePopupMenu, CreateWindowExW,
+                    DefWindowProcW, DestroyMenu, DispatchMessageW, GA_ROOT,
+                    GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+                    GetWindow,
+                    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HHOOK, HMENU,
+                    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
+                    IMAGE_ICON, KBDLLHOOKSTRUCT, KillTimer, LR_LOADFROMFILE, LoadCursorW, LoadImageW,
+                    MSLLHOOKSTRUCT, IsIconic, IsZoomed,
+                    MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SM_CXSCREEN,
+                    SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+                    SWP_NOSIZE, SWP_NOZORDER,
+                    SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+                    SetWindowPos, SetWindowsHookExW, SetCursorPos, ShowWindow,
+                    TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+                    TrackPopupMenu, TranslateMessage, ULW_ALPHA, UnhookWindowsHookEx,
+                    UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
+                    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+                    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WM_NCHITTEST, HTTRANSPARENT,
+                    WM_MOUSEACTIVATE, MA_NOACTIVATE,
+                    WM_MOUSEMOVE, WM_MOUSEWHEEL,
+                    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW,
+                    WS_POPUP, GWLP_USERDATA, HC_ACTION, GW_OWNER,
+                },
+            },
+        },
+        core::{PCWSTR, w},
+    };
+
+    use crate::{
+        audio,
+        hotkey,
+        model::{
+            AudioSettings, CrosshairStyle, HotkeyBinding, MacroAction, MacroGroup, MacroPreset,
+            MacroStep, MacroTriggerMode, MousePathEvent, MousePathEventKind, MousePathPreset,
+            PinPreset, ProfileRecord, RgbaColor, SoundLibraryItem, SoundPreset, ToolboxPreset,
+            WindowAnchor, WindowExpandControls, WindowExpandDirection, WindowFocusPreset,
+            WindowPreset, ZoomPreset,
+        },
+        render::{RenderedCrosshair, render_crosshair},
+        storage::AppPaths,
+    };
+
+    const HOTKEY_ID: i32 = 1001;
+    const TIMER_ID: usize = 1;
+    const TRAY_UID: u32 = 7001;
+    const XBUTTON1_DATA: u16 = 0x0001;
+    const XBUTTON2_DATA: u16 = 0x0002;
+    const WMAPP_TRAYICON: u32 = WM_APP + 1;
+    const MACRO_PRESET_BASE_ID: i32 = 10000;
+
+    const MENU_TOGGLE: usize = 2001;
+    const MENU_SHOW: usize = 2002;
+    const MENU_EXIT: usize = 2003;
+
+    static SUPPRESSED_MACRO_HOTKEYS: Lazy<Mutex<HashSet<i32>>> =
+        Lazy::new(|| Mutex::new(HashSet::new()));
+    static STOP_REQUESTED_MACRO_PRESETS: Lazy<Mutex<HashSet<u32>>> =
+        Lazy::new(|| Mutex::new(HashSet::new()));
+    static TOOLBOX_DISPLAY: Lazy<Mutex<Option<ToolboxDisplayState>>> =
+        Lazy::new(|| Mutex::new(None));
+    static MOUSE_RECORDING: Lazy<Mutex<Option<MouseRecordingSession>>> =
+        Lazy::new(|| Mutex::new(None));
+    static HOOK_STATE: Lazy<Mutex<HookState>> = Lazy::new(|| Mutex::new(HookState::default()));
+    static OVERLAY_COMMAND_TX: Lazy<Mutex<Option<Sender<OverlayCommand>>>> =
+        Lazy::new(|| Mutex::new(None));
+
+    #[derive(Debug, Clone)]
+    pub enum OverlayCommand {
+        Update(CrosshairStyle),
+        UpdateProfiles(Vec<ProfileRecord>),
+        UpdateWindowPresets(Vec<WindowPreset>),
+        UpdateWindowFocusPresets(Vec<WindowFocusPreset>),
+        #[allow(dead_code)]
+        UpdateWindowExpandControls(WindowExpandControls),
+        UpdatePinPresets(Vec<PinPreset>),
+        UpdateMousePathPresets(Vec<MousePathPreset>),
+        UpdateZoomPresets(Vec<ZoomPreset>),
+        UpdateToolboxPresets(Vec<ToolboxPreset>),
+        UpdateMacroPresets(Vec<MacroGroup>),
+        UpdateAudioSettings(AudioSettings),
+        SetMacrosMasterEnabled(bool),
+        SetUiVisible(bool),
+        Exit,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum UiCommand {
+        ShowWindow,
+        Exit,
+        SyncMacroGroups(Vec<MacroGroup>, String),
+        MousePathRecordingStarted(u32, String),
+        MousePathRecordingFinished(u32, Vec<MousePathEvent>, String),
+    }
+
+    pub struct OverlayHandle {
+        tx: Sender<OverlayCommand>,
+    }
+
+    impl OverlayHandle {
+        pub fn send(&self, command: OverlayCommand) {
+            let _ = self.tx.send(command);
+        }
+    }
+
+    struct HookState {
+        ui_tx: Option<Sender<UiCommand>>,
+        window_presets: Vec<WindowPreset>,
+        window_focus_presets: Vec<WindowFocusPreset>,
+        window_expand_controls: WindowExpandControls,
+        pin_presets: Vec<PinPreset>,
+        mouse_path_presets: Vec<MousePathPreset>,
+        active_pin_preset_id: Option<u32>,
+        zoom_presets: Vec<ZoomPreset>,
+        toolbox_presets: Vec<ToolboxPreset>,
+        active_zoom_preset_id: Option<u32>,
+        macro_groups: Vec<MacroGroup>,
+        macros_master_enabled: bool,
+        locked_inputs: HashMap<String, usize>,
+        locked_mouse_count: usize,
+        current_style: CrosshairStyle,
+        profiles: Vec<ProfileRecord>,
+        sound_presets: Vec<SoundPreset>,
+        sound_library: Vec<SoundLibraryItem>,
+        active_hold_macros: HashMap<u32, ActiveHoldMacro>,
+        pending_selector: Option<PendingMacroSelector>,
+        next_hold_run_token: u64,
+        stop_ignore_keys: HashMap<u32, String>,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        win: bool,
+        held_inputs: HashSet<String>,
+        pressed_inputs: HashSet<String>,
+        held_mouse_buttons: HashSet<String>,
+    }
+
+    impl Default for HookState {
+        fn default() -> Self {
+            Self {
+                ui_tx: None,
+                window_presets: Vec::new(),
+                window_focus_presets: Vec::new(),
+                window_expand_controls: WindowExpandControls::default(),
+                pin_presets: Vec::new(),
+                mouse_path_presets: Vec::new(),
+                active_pin_preset_id: None,
+                zoom_presets: Vec::new(),
+                toolbox_presets: Vec::new(),
+                active_zoom_preset_id: None,
+                macro_groups: Vec::new(),
+                macros_master_enabled: true,
+                locked_inputs: HashMap::new(),
+                locked_mouse_count: 0,
+                current_style: CrosshairStyle::default(),
+                profiles: Vec::new(),
+                sound_presets: Vec::new(),
+                sound_library: Vec::new(),
+                active_hold_macros: HashMap::new(),
+                pending_selector: None,
+                next_hold_run_token: 1,
+                stop_ignore_keys: HashMap::new(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                win: false,
+                held_inputs: HashSet::new(),
+                pressed_inputs: HashSet::new(),
+                held_mouse_buttons: HashSet::new(),
+            }
+        }
+    }
+
+    struct Runtime {
+        rx: Receiver<OverlayCommand>,
+        ui_tx: Sender<UiCommand>,
+        paths: AppPaths,
+        style: CrosshairStyle,
+        window_presets: Vec<WindowPreset>,
+        window_focus_presets: Vec<WindowFocusPreset>,
+        pin_presets: Vec<PinPreset>,
+        mouse_path_presets: Vec<MousePathPreset>,
+        macro_groups: Vec<MacroGroup>,
+        audio_settings: AudioSettings,
+        registered_window_hotkeys: HashMap<i32, WindowHotkeyAction>,
+        registered_macro_hotkeys: HashMap<i32, MacroPreset>,
+        overlay_hwnd: HWND,
+        mouse_trail_hwnd: HWND,
+        toolbox_hwnd: HWND,
+        pin_hwnd: HWND,
+        zoom_host_hwnd: HWND,
+        zoom_mag_hwnd: HWND,
+        last_zoom_update: Instant,
+        toolbox_display: Option<ToolboxDisplayState>,
+        tray_menu: HMENU,
+        keyboard_hook: HHOOK,
+        mouse_hook: HHOOK,
+        running: Arc<AtomicBool>,
+        active_pin_thumbnail: Option<ActivePinThumbnail>,
+    }
+
+    struct MouseRecordingSession {
+        preset_id: u32,
+        last_event_at: Instant,
+        events: Vec<MousePathEvent>,
+        dirty: bool,
+    }
+
+    #[derive(Clone)]
+    struct PendingMacroSelector {
+        group_id: u32,
+        selector_id: u32,
+        prompt_text: String,
+        options: Vec<PendingSelectorOption>,
+    }
+
+    #[derive(Clone)]
+    struct PendingSelectorOption {
+        option_id: u32,
+        choice_key: String,
+        enable_preset_ids: Vec<u32>,
+        disable_preset_ids: Vec<u32>,
+        toolbox_text: String,
+    }
+
+    enum MacroRunFlow {
+        Continue,
+        BreakLoop,
+        StopExecution,
+    }
+
+    #[derive(Clone)]
+    struct ActiveHoldMacro {
+        trigger: HotkeyBinding,
+        release_steps: Vec<MacroStep>,
+        hold_stop_step: Option<MacroStep>,
+        locked_keys: Vec<String>,
+        locked_mouse_count: usize,
+        run_token: u64,
+        completed: bool,
+    }
+
+    #[derive(Clone, PartialEq)]
+    struct ToolboxDisplayState {
+        owner_preset_id: Option<u32>,
+        preset_id: Option<u32>,
+        text: String,
+        text_color: RgbaColor,
+        background_color: RgbaColor,
+        background_opacity: f32,
+        rounded_background: bool,
+        font_size: f32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        auto_hide_on_owner_completion: bool,
+        expires_at: Option<Instant>,
+    }
+
+    struct ActivePinThumbnail {
+        preset_id: u32,
+        source_hwnd: HWND,
+        thumbnail_id: isize,
+    }
+
+    #[allow(dead_code)]
+    enum WindowHotkeyAction {
+        Apply(WindowPreset),
+        Focus(WindowFocusPreset),
+        Animate(WindowPreset),
+        RestoreTitleBar(WindowPreset),
+    }
+
+    pub fn start(
+        paths: AppPaths,
+        initial_style: CrosshairStyle,
+        ui_tx: Sender<UiCommand>,
+    ) -> Result<OverlayHandle> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *OVERLAY_COMMAND_TX.lock() = Some(tx.clone());
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+
+        thread::spawn(move || {
+            let result = run_thread(paths, initial_style, rx, ui_tx, worker_running.clone());
+            if let Err(error) = result {
+                eprintln!("overlay error: {error:#}");
+            }
+            worker_running.store(false, Ordering::Relaxed);
+        });
+
+        Ok(OverlayHandle { tx })
+    }
+
+    fn run_thread(
+        paths: AppPaths,
+        initial_style: CrosshairStyle,
+        rx: Receiver<OverlayCommand>,
+        ui_tx: Sender<UiCommand>,
+        running: Arc<AtomicBool>,
+    ) -> Result<()> {
+        unsafe {
+            let instance = HINSTANCE(GetModuleHandleW(None)?.0);
+            register_class(instance, w!("CrosshairController"), Some(controller_wnd_proc))?;
+            register_class(instance, w!("CrosshairOverlay"), Some(overlay_wnd_proc))?;
+            register_class(instance, w!("CrosshairToolbox"), Some(toolbox_wnd_proc))?;
+            let _ = MagInitialize();
+
+            let overlay_hwnd = CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST
+                    | WS_EX_NOACTIVATE,
+                w!("CrosshairOverlay"),
+                w!("CrosshairOverlay"),
+                WS_POPUP,
+                0,
+                0,
+                32,
+                32,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+
+            let mouse_trail_hwnd = CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST
+                    | WS_EX_NOACTIVATE,
+                w!("CrosshairOverlay"),
+                w!("CrosshairMouseTrail"),
+                WS_POPUP,
+                0,
+                0,
+                32,
+                32,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+
+            let toolbox_hwnd = CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TRANSPARENT,
+                w!("CrosshairToolbox"),
+                w!("CrosshairToolbox"),
+                WS_POPUP,
+                0,
+                0,
+                360,
+                44,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+
+            let pin_hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                w!("CrosshairOverlay"),
+                w!("CrosshairPinHost"),
+                WS_POPUP,
+                0,
+                0,
+                320,
+                180,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+
+            let zoom_host_hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                w!("CrosshairOverlay"),
+                w!("CrosshairZoomHost"),
+                WS_POPUP,
+                0,
+                0,
+                320,
+                180,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+
+            let zoom_mag_hwnd = CreateWindowExW(
+                Default::default(),
+                WC_MAGNIFIER,
+                w!("CrosshairZoomMagnifier"),
+                WS_CHILD
+                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
+                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(MS_SHOWMAGNIFIEDCURSOR as u32),
+                0,
+                0,
+                320,
+                180,
+                Some(zoom_host_hwnd),
+                None,
+                Some(instance),
+                None,
+            )?;
+
+            let tray_menu = CreatePopupMenu()?;
+            let _ = AppendMenuW(tray_menu, MF_STRING, MENU_TOGGLE, w!("Toggle crosshair"));
+            let _ = AppendMenuW(tray_menu, MF_STRING, MENU_SHOW, w!("Open settings"));
+            let _ = AppendMenuW(tray_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(tray_menu, MF_STRING, MENU_EXIT, w!("Exit"));
+
+            let keyboard_hook =
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), Some(instance), 0)?;
+            let mouse_hook =
+                SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), Some(instance), 0)?;
+
+            {
+                let mut hook_state = HOOK_STATE.lock();
+                hook_state.ui_tx = Some(ui_tx.clone());
+            }
+
+            let runtime = Box::new(Runtime {
+                rx,
+                ui_tx,
+                paths,
+                style: initial_style,
+                window_presets: Vec::new(),
+                window_focus_presets: Vec::new(),
+                pin_presets: Vec::new(),
+                mouse_path_presets: Vec::new(),
+                macro_groups: Vec::new(),
+                audio_settings: AudioSettings::default(),
+                registered_window_hotkeys: HashMap::new(),
+                registered_macro_hotkeys: HashMap::new(),
+                overlay_hwnd,
+                mouse_trail_hwnd,
+                toolbox_hwnd,
+                pin_hwnd,
+                zoom_host_hwnd,
+                zoom_mag_hwnd,
+                last_zoom_update: Instant::now(),
+                toolbox_display: None,
+                tray_menu,
+                keyboard_hook,
+                mouse_hook,
+                running,
+                active_pin_thumbnail: None,
+            });
+
+            let _controller_hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("CrosshairController"),
+                w!("CrosshairController"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                Some(Box::into_raw(runtime) as *const c_void),
+            )?;
+
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, None, 0, 0).into() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+
+        Ok(())
+    }
+
+    unsafe fn register_class(
+        instance: HINSTANCE,
+        name: PCWSTR,
+        proc: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>,
+    ) -> Result<()> {
+        let cursor = LoadCursorW(None, IDC_ARROW)?;
+        let class = WNDCLASSW {
+            lpfnWndProc: proc,
+            hInstance: instance,
+            lpszClassName: name,
+            hCursor: cursor,
+            ..Default::default()
+        };
+        if RegisterClassW(&class) == 0 {
+            bail!("Failed to register the window class");
+        }
+        Ok(())
+    }
+
+    unsafe extern "system" fn overlay_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_NCHITTEST {
+            return LRESULT(HTTRANSPARENT as isize);
+        }
+        if msg == WM_MOUSEACTIVATE {
+            return LRESULT(MA_NOACTIVATE as isize);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    unsafe extern "system" fn controller_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_NCCREATE => {
+                let create = lparam.0 as *const CREATESTRUCTW;
+                let runtime = (*create).lpCreateParams as *mut Runtime;
+                SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0), runtime as isize);
+                LRESULT(1)
+            }
+            WM_CREATE => {
+                if let Some(runtime) = runtime_mut(hwnd) {
+                    let _ = add_tray_icon(hwnd);
+                    let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_CONTROL | MOD_ALT, b'X' as u32);
+                    let _ = SetTimer(Some(hwnd), TIMER_ID, 33, None);
+                    let _ = refresh_overlay(runtime);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                if let Some(runtime) = runtime_mut(hwnd) {
+                    while let Ok(command) = runtime.rx.try_recv() {
+                        match command {
+                            OverlayCommand::Update(style) => {
+                                runtime.style = style.clone();
+                                HOOK_STATE.lock().current_style = style;
+                                let _ = refresh_overlay(runtime);
+                            }
+                            OverlayCommand::UpdateProfiles(profiles) => {
+                                HOOK_STATE.lock().profiles = profiles;
+                            }
+                            OverlayCommand::UpdateWindowPresets(presets) => {
+                                runtime.window_presets = presets;
+                                let _ = sync_window_hotkeys(hwnd, runtime);
+                            }
+                            OverlayCommand::UpdateWindowFocusPresets(presets) => {
+                                runtime.window_focus_presets = presets;
+                                let _ = sync_window_hotkeys(hwnd, runtime);
+                            }
+                            OverlayCommand::UpdateWindowExpandControls(controls) => {
+                                HOOK_STATE.lock().window_expand_controls = controls;
+                            }
+                            OverlayCommand::UpdatePinPresets(presets) => {
+                                let mut hook_state = HOOK_STATE.lock();
+                                hook_state.pin_presets = presets.clone();
+                                runtime.pin_presets = presets;
+                                if let Some(active_id) = hook_state.active_pin_preset_id
+                                    && !hook_state.pin_presets.iter().any(|preset| preset.id == active_id)
+                                {
+                                    hook_state.active_pin_preset_id = None;
+                                }
+                            }
+                            OverlayCommand::UpdateMousePathPresets(presets) => {
+                                HOOK_STATE.lock().mouse_path_presets = presets.clone();
+                                runtime.mouse_path_presets = presets;
+                            }
+                            OverlayCommand::UpdateZoomPresets(presets) => {
+                                let mut hook_state = HOOK_STATE.lock();
+                                hook_state.zoom_presets = presets;
+                                if let Some(active_id) = hook_state.active_zoom_preset_id
+                                    && !hook_state
+                                        .zoom_presets
+                                        .iter()
+                                        .any(|preset| preset.id == active_id)
+                                {
+                                    hook_state.active_zoom_preset_id = None;
+                                }
+                            }
+                            OverlayCommand::UpdateToolboxPresets(presets) => {
+                                HOOK_STATE.lock().toolbox_presets = presets;
+                            }
+                            OverlayCommand::UpdateMacroPresets(presets) => {
+                                runtime.macro_groups = presets;
+                                let _ = sync_macro_hotkeys(hwnd, runtime);
+                            }
+                            OverlayCommand::UpdateAudioSettings(settings) => {
+                                let mut hook_state = HOOK_STATE.lock();
+                                hook_state.sound_presets = settings.presets.clone();
+                                hook_state.sound_library = settings.library.clone();
+                                runtime.audio_settings = settings;
+                            }
+                            OverlayCommand::SetMacrosMasterEnabled(enabled) => {
+                                HOOK_STATE.lock().macros_master_enabled = enabled;
+                            }
+                            OverlayCommand::SetUiVisible(visible) => {
+                                if visible {
+                                    show_ui_window_native();
+                                } else {
+                                    hide_ui_window_native();
+                                }
+                            }
+                            OverlayCommand::Exit => {
+                                let _ = runtime.ui_tx.send(UiCommand::Exit);
+                                let _ = shutdown_application(hwnd, runtime);
+                            }
+                        }
+                    }
+                    let _ = refresh_pin_overlay(runtime);
+                    let _ = refresh_zoom(runtime);
+                    let _ = refresh_toolbox(runtime);
+                    let _ = refresh_mouse_record_trail(runtime);
+                }
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                if let Some(runtime) = runtime_mut(hwnd) {
+                    if is_ui_in_foreground() {
+                        return LRESULT(0);
+                    }
+
+                    let hotkey_id = wparam.0 as i32;
+                    if hotkey_id == HOTKEY_ID {
+                        runtime.style.enabled = !runtime.style.enabled;
+                        let _ = refresh_overlay(runtime);
+                    } else if let Some(action) = runtime.registered_window_hotkeys.get(&hotkey_id) {
+                        match action {
+                            WindowHotkeyAction::Apply(preset) => {
+                                let _ = apply_window_preset(preset);
+                            }
+                            WindowHotkeyAction::Focus(preset) => {
+                                let _ = focus_window_for_preset(preset);
+                            }
+                            WindowHotkeyAction::Animate(preset) => {
+                                let preset = preset.clone();
+                                thread::spawn(move || {
+                                    let _ = apply_window_preset_animated(&preset);
+                                });
+                            }
+                            WindowHotkeyAction::RestoreTitleBar(preset) => {
+                                let _ = restore_window_title_bar_for_preset(preset);
+                            }
+                        }
+                    } else if let Some(preset) = runtime.registered_macro_hotkeys.get(&hotkey_id) {
+                        if !SUPPRESSED_MACRO_HOTKEYS.lock().contains(&hotkey_id) {
+                            let trigger_key =
+                                preset.hotkey.as_ref().map(|binding| binding.key.clone()).unwrap_or_default();
+                            let _ = play_macro_preset(
+                                hotkey_id,
+                                preset.clone(),
+                                None,
+                                Vec::new(),
+                                false,
+                                trigger_key,
+                            );
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                if let Some(runtime) = runtime_mut(hwnd) {
+                    match wparam.0 {
+                        MENU_TOGGLE => {
+                            runtime.style.enabled = !runtime.style.enabled;
+                            let _ = refresh_overlay(runtime);
+                        }
+                        MENU_SHOW => {
+                            show_ui_window_native();
+                            let _ = runtime.ui_tx.send(UiCommand::ShowWindow);
+                        }
+                        MENU_EXIT => {
+                            let _ = runtime.ui_tx.send(UiCommand::Exit);
+                            let _ = shutdown_application(hwnd, runtime);
+                        }
+                        _ => {}
+                    }
+                }
+                LRESULT(0)
+            }
+            WMAPP_TRAYICON => {
+                match lparam.0 as u32 {
+                    WM_RBUTTONUP => {
+                        if let Some(runtime) = runtime_mut(hwnd) {
+                            let mut point = POINT::default();
+                            let _ = GetCursorPos(&mut point);
+                            let _ = SetForegroundWindow(hwnd);
+                            let _ = TrackPopupMenu(
+                                runtime.tray_menu,
+                                TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                                point.x,
+                                point.y,
+                                Some(0),
+                                hwnd,
+                                None,
+                            );
+                        }
+                    }
+                    WM_LBUTTONUP => {
+                        if let Some(runtime) = runtime_mut(hwnd) {
+                            show_ui_window_native();
+                            let _ = runtime.ui_tx.send(UiCommand::ShowWindow);
+                        }
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), TIMER_ID);
+                unregister_all_hotkeys(hwnd, runtime_mut(hwnd));
+                let _ = Shell_NotifyIconW(NIM_DELETE, &notify_icon(hwnd));
+                if let Some(runtime) = runtime_mut(hwnd) {
+                    runtime.running.store(false, Ordering::Relaxed);
+                    let _ = DestroyMenu(runtime.tray_menu);
+                    let _ = ShowWindow(runtime.overlay_hwnd, SW_HIDE);
+                    let _ = ShowWindow(runtime.toolbox_hwnd, SW_HIDE);
+                    let _ = ShowWindow(runtime.zoom_host_hwnd, SW_HIDE);
+                    let _ = UnhookWindowsHookEx(runtime.keyboard_hook);
+                    let _ = UnhookWindowsHookEx(runtime.mouse_hook);
+                    let _ = MagUninitialize();
+                }
+                let mut hook_state = HOOK_STATE.lock();
+                hook_state.ui_tx = None;
+                hook_state.window_presets.clear();
+                hook_state.window_expand_controls = WindowExpandControls::default();
+                hook_state.zoom_presets.clear();
+                hook_state.active_zoom_preset_id = None;
+                hook_state.macro_groups.clear();
+                hook_state.locked_inputs.clear();
+                hook_state.locked_mouse_count = 0;
+                hook_state.profiles.clear();
+                hook_state.sound_presets.clear();
+                hook_state.sound_library.clear();
+                hook_state.active_hold_macros.clear();
+                hook_state.held_mouse_buttons.clear();
+                *OVERLAY_COMMAND_TX.lock() = None;
+                let ptr = GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0));
+                if ptr != 0 {
+                    let _runtime = Box::from_raw(ptr as *mut Runtime);
+                }
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe extern "system" fn toolbox_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            windows::Win32::UI::WindowsAndMessaging::WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let _ = BeginPaint(hwnd, &mut paint);
+                let _ = EndPaint(hwnd, &paint);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, _wparam, _lparam),
+        }
+    }
+
+    unsafe extern "system" fn low_level_keyboard_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let info = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+            let msg = wparam.0 as u32;
+            let is_key_event =
+                matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP);
+            let injected = info.flags.0 & 0x10 != 0;
+            if is_key_event && !injected {
+                let is_key_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+                let is_key_up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
+                let key_name = hotkey::vk_to_key_name(info.vkCode).map(str::to_owned);
+
+                if let Some(key_name) = key_name.clone() {
+                    let binding = binding_from_event(&key_name);
+                    let mut swallow = false;
+                    if is_key_down {
+                        let repeat = is_repeat_key(&key_name);
+                        if let Some(binding_swallow) = process_binding_press(&binding, repeat) {
+                            swallow |= binding_swallow;
+                        }
+                    }
+                    if is_key_up {
+                        swallow |= process_binding_release(&binding);
+                    }
+
+                    update_held_key(&key_name, is_key_down, is_key_up);
+                    swallow |= is_locked_input(&key_name);
+                    update_modifier_state(info.vkCode, is_key_down);
+                    return if swallow {
+                        LRESULT(1)
+                    } else {
+                        CallNextHookEx(None, code, wparam, lparam)
+                    };
+                }
+                update_modifier_state(info.vkCode, is_key_down);
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    unsafe extern "system" fn low_level_mouse_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+            let injected = info.flags & 0x01 != 0;
+            if injected {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
+            let message = wparam.0 as u32;
+            if is_ui_in_foreground() && matches!(message, WM_XBUTTONDOWN | WM_XBUTTONUP) {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
+            record_mouse_event(message, &info);
+            let mouse_lock_active = is_mouse_locked();
+            if mouse_lock_active {
+                match message {
+                    WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
+                    | WM_RBUTTONUP | WM_MBUTTONDOWN | windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONUP
+                    | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                        update_held_mouse_button(message, ((info.mouseData >> 16) & 0xFFFF) as u16);
+                        return LRESULT(1);
+                    }
+                    _ => {}
+                }
+            }
+            let event = match (wparam.0 as u32, ((info.mouseData >> 16) & 0xFFFF) as u16) {
+                (WM_LBUTTONDOWN, _) => Some((binding_from_event("MouseLeft"), true)),
+                (WM_LBUTTONUP, _) => Some((binding_from_event("MouseLeft"), false)),
+                (WM_RBUTTONDOWN, _) => Some((binding_from_event("MouseRight"), true)),
+                (WM_RBUTTONUP, _) => Some((binding_from_event("MouseRight"), false)),
+                (WM_MBUTTONDOWN, _) => Some((binding_from_event("MouseMiddle"), true)),
+                (windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONUP, _) => {
+                    Some((binding_from_event("MouseMiddle"), false))
+                }
+                (WM_XBUTTONDOWN, XBUTTON1_DATA) => Some((binding_from_event("MouseX1"), true)),
+                (WM_XBUTTONUP, XBUTTON1_DATA) => Some((binding_from_event("MouseX1"), false)),
+                (WM_XBUTTONDOWN, XBUTTON2_DATA) => Some((binding_from_event("MouseX2"), true)),
+                (WM_XBUTTONUP, XBUTTON2_DATA) => Some((binding_from_event("MouseX2"), false)),
+                _ => None,
+            };
+            if let Some((binding, is_down)) = event {
+                update_held_mouse_button(message, ((info.mouseData >> 16) & 0xFFFF) as u16);
+                let swallow = if is_down {
+                    process_binding_press(&binding, false).unwrap_or(false)
+                } else {
+                    process_binding_release(&binding)
+                };
+                return if swallow {
+                    LRESULT(1)
+                } else {
+                    CallNextHookEx(None, code, wparam, lparam)
+                };
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    fn binding_from_event(key_name: &str) -> HotkeyBinding {
+        let ctrl_down = unsafe { GetAsyncKeyState(0x11) } < 0;
+        let alt_down = unsafe { GetAsyncKeyState(0x12) } < 0;
+        let shift_down = unsafe { GetAsyncKeyState(0x10) } < 0;
+        let win_down = unsafe { GetAsyncKeyState(0x5B) } < 0 || unsafe { GetAsyncKeyState(0x5C) } < 0;
+        HotkeyBinding {
+            ctrl: ctrl_down && !key_name.eq_ignore_ascii_case("Ctrl"),
+            alt: alt_down && !key_name.eq_ignore_ascii_case("Alt"),
+            shift: shift_down && !key_name.eq_ignore_ascii_case("Shift"),
+            win: win_down && !key_name.eq_ignore_ascii_case("Win"),
+            key: key_name.to_owned(),
+        }
+    }
+
+    fn process_mouse_path_record_hotkey(binding: &HotkeyBinding, is_repeat: bool) -> Option<bool> {
+        if is_repeat {
+            return None;
+        }
+        let matched = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .mouse_path_presets
+                .iter()
+                .find(|preset| {
+                    preset.enabled
+                        && preset.record_hotkey.as_ref().is_some_and(|hotkey| {
+                            hotkey::binding_matches(
+                                hotkey,
+                                &binding.key,
+                                binding.ctrl,
+                                binding.alt,
+                                binding.shift,
+                                binding.win,
+                            )
+                        })
+                })
+                .cloned()
+        };
+        let Some(preset) = matched else {
+            return None;
+        };
+        toggle_mouse_recording(preset.id, preset.name);
+        Some(true)
+    }
+
+    fn toggle_mouse_recording(preset_id: u32, preset_name: String) {
+        let finished = {
+            let mut guard = MOUSE_RECORDING.lock();
+            if guard.as_ref().is_some_and(|session| session.preset_id == preset_id) {
+                guard.take().map(|session| (session.preset_id, session.events))
+            } else {
+                *guard = Some(MouseRecordingSession {
+                    preset_id,
+                    last_event_at: Instant::now(),
+                    events: Vec::new(),
+                    dirty: true,
+                });
+                None
+            }
+        };
+
+        let ui_tx = HOOK_STATE.lock().ui_tx.clone();
+        if let Some((finished_id, events)) = finished {
+            if let Some(tx) = ui_tx {
+                let _ = tx.send(UiCommand::MousePathRecordingFinished(
+                    finished_id,
+                    events,
+                    format!("Saved mouse record for {preset_name}."),
+                ));
+            }
+        } else if let Some(tx) = ui_tx {
+            let _ = tx.send(UiCommand::MousePathRecordingStarted(
+                preset_id,
+                format!("Recording mouse path for {preset_name}. Press the hotkey again to stop."),
+            ));
+        }
+    }
+
+    fn record_mouse_event(message: u32, info: &MSLLHOOKSTRUCT) {
+        let mut guard = MOUSE_RECORDING.lock();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let delay_ms = now
+            .saturating_duration_since(session.last_event_at)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        session.last_event_at = now;
+        let point = info.pt;
+        let kind = match (message, ((info.mouseData >> 16) & 0xFFFF) as u16) {
+            (WM_MOUSEMOVE, _) => Some(MousePathEventKind::Move),
+            (WM_LBUTTONDOWN, _) => Some(MousePathEventKind::LeftDown),
+            (WM_LBUTTONUP, _) => Some(MousePathEventKind::LeftUp),
+            (WM_RBUTTONDOWN, _) => Some(MousePathEventKind::RightDown),
+            (WM_RBUTTONUP, _) => Some(MousePathEventKind::RightUp),
+            (WM_MBUTTONDOWN, _) => Some(MousePathEventKind::MiddleDown),
+            (windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONUP, _) => {
+                Some(MousePathEventKind::MiddleUp)
+            }
+            (WM_MOUSEWHEEL, data) if (data as i16) > 0 => Some(MousePathEventKind::WheelUp),
+            (WM_MOUSEWHEEL, _) => Some(MousePathEventKind::WheelDown),
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            return;
+        };
+        if matches!(kind, MousePathEventKind::Move)
+            && session.events.last().is_some_and(|last| {
+                matches!(last.kind, MousePathEventKind::Move) && last.x == point.x && last.y == point.y
+            })
+        {
+            return;
+        }
+        session.events.push(MousePathEvent {
+            kind,
+            x: point.x,
+            y: point.y,
+            delay_ms,
+        });
+        session.dirty = true;
+    }
+
+    fn process_binding_press(binding: &HotkeyBinding, is_repeat: bool) -> Option<bool> {
+        if is_ui_in_foreground() {
+            return Some(false);
+        }
+
+        if let Some(swallow) = process_mouse_path_record_hotkey(binding, is_repeat) {
+            return Some(swallow);
+        }
+
+        if !binding.ctrl && !binding.alt && !binding.shift && !binding.win
+            && let Ok(consumed) = apply_selector_choice(&binding.key)
+            && consumed
+        {
+            return Some(true);
+        }
+
+        let hook_state = HOOK_STATE.lock();
+        let mut matched_any_window = false;
+        let mut window_actions = Vec::new();
+        let mut zoom_toggle_id = None;
+        for preset in &hook_state.zoom_presets {
+            if !preset.enabled {
+                continue;
+            }
+            if !window_focus_matches(
+                preset.target_window_title.as_deref(),
+                &preset.extra_target_window_titles,
+                false,
+            ) {
+                continue;
+            }
+            if let Some(hotkey) = preset.hotkey.as_ref()
+                && hotkey::binding_matches(
+                    hotkey,
+                    &binding.key,
+                    binding.ctrl,
+                    binding.alt,
+                    binding.shift,
+                    binding.win,
+                )
+                && !is_repeat
+            {
+                zoom_toggle_id = Some(preset.id);
+                break;
+            }
+        }
+        if let Some(preset_id) = zoom_toggle_id {
+            drop(hook_state);
+            let mut hook_state = HOOK_STATE.lock();
+            if hook_state.active_zoom_preset_id == Some(preset_id) {
+                hook_state.active_zoom_preset_id = None;
+            } else {
+                hook_state.active_zoom_preset_id = Some(preset_id);
+            }
+            return Some(false);
+        }
+        for preset in &hook_state.window_presets {
+            if !preset.enabled {
+                continue;
+            }
+            if !window_focus_matches(
+                preset.target_window_title.as_deref(),
+                &preset.extra_target_window_titles,
+                false,
+            ) {
+                continue;
+            }
+            if let Some(hotkey) = preset.hotkey.as_ref()
+                && hotkey::binding_matches(
+                    hotkey,
+                    &binding.key,
+                    binding.ctrl,
+                    binding.alt,
+                    binding.shift,
+                    binding.win,
+                )
+                && !is_repeat
+            {
+                matched_any_window = true;
+                window_actions.push(WindowHotkeyAction::Apply(preset.clone()));
+            }
+        }
+
+        for preset in &hook_state.window_focus_presets {
+            if !preset.enabled {
+                continue;
+            }
+            if let Some(hotkey) = preset.hotkey.as_ref()
+                && hotkey::binding_matches(
+                    hotkey,
+                    &binding.key,
+                    binding.ctrl,
+                    binding.alt,
+                    binding.shift,
+                    binding.win,
+                )
+                && !is_repeat
+            {
+                matched_any_window = true;
+                window_actions.push(WindowHotkeyAction::Focus(preset.clone()));
+            }
+        }
+
+        let mut pin_toggle_id = None;
+        for preset in &hook_state.pin_presets {
+            if !preset.enabled {
+                continue;
+            }
+            if let Some(hotkey) = preset.hotkey.as_ref()
+                && hotkey::binding_matches(
+                    hotkey,
+                    &binding.key,
+                    binding.ctrl,
+                    binding.alt,
+                    binding.shift,
+                    binding.win,
+                )
+                && !is_repeat
+            {
+                pin_toggle_id = Some(preset.id);
+                break;
+            }
+        }
+        if let Some(preset_id) = pin_toggle_id {
+            drop(hook_state);
+            let mut hook_state = HOOK_STATE.lock();
+            if hook_state.active_pin_preset_id == Some(preset_id) {
+                hook_state.active_pin_preset_id = None;
+            } else {
+                hook_state.active_pin_preset_id = Some(preset_id);
+            }
+            return Some(false);
+        }
+
+        for preset in &hook_state.window_presets {
+            if !preset.enabled {
+                continue;
+            }
+            if !window_focus_matches(
+                preset.target_window_title.as_deref(),
+                &preset.extra_target_window_titles,
+                false,
+            ) {
+                continue;
+            }
+            if preset.animate_enabled
+                && let Some(hotkey) = preset.animate_hotkey.as_ref()
+                && hotkey::binding_matches(
+                    hotkey,
+                    &binding.key,
+                    binding.ctrl,
+                    binding.alt,
+                    binding.shift,
+                    binding.win,
+                )
+                && !is_repeat
+            {
+                matched_any_window = true;
+                window_actions.push(WindowHotkeyAction::Animate(preset.clone()));
+            }
+            if preset.restore_titlebar_enabled
+                && let Some(hotkey) = preset.titlebar_hotkey.as_ref()
+                && hotkey::binding_matches(
+                    hotkey,
+                    &binding.key,
+                    binding.ctrl,
+                    binding.alt,
+                    binding.shift,
+                    binding.win,
+                )
+                && !is_repeat
+            {
+                matched_any_window = true;
+                window_actions.push(WindowHotkeyAction::RestoreTitleBar(preset.clone()));
+            }
+        }
+
+        if !hook_state.macros_master_enabled {
+            drop(hook_state);
+            for action in window_actions {
+                match action {
+                    WindowHotkeyAction::Apply(preset) => {
+                        let _ = apply_window_preset(&preset);
+                    }
+                    WindowHotkeyAction::Focus(preset) => {
+                        let _ = focus_window_for_preset(&preset);
+                    }
+                    WindowHotkeyAction::Animate(preset) => {
+                        thread::spawn(move || {
+                            let _ = apply_window_preset_animated(&preset);
+                        });
+                    }
+                    WindowHotkeyAction::RestoreTitleBar(preset) => {
+                        let _ = restore_window_title_bar_for_preset(&preset);
+                    }
+                }
+            }
+            return Some(false);
+        }
+
+        let mut matched_any_macro = false;
+        let mut hold_matches: Vec<(MacroPreset, HotkeyBinding, Option<String>, Vec<String>, bool, String)> =
+            Vec::new();
+        let mut press_matches: Vec<(MacroPreset, Option<String>, Vec<String>, bool, String)> = Vec::new();
+        let mut selector_matches: Vec<(u32, u32)> = Vec::new();
+
+        for group in &hook_state.macro_groups {
+            if !group.enabled {
+                continue;
+            }
+            if !macro_target_matches(group) {
+                continue;
+            }
+            for selector in &group.selector_presets {
+                if !selector.enabled {
+                    continue;
+                }
+                if let Some(hotkey) = selector.hotkey.as_ref()
+                    && hotkey::binding_matches(
+                        hotkey,
+                        &binding.key,
+                        binding.ctrl,
+                        binding.alt,
+                        binding.shift,
+                        binding.win,
+                    )
+                    && !is_repeat
+                {
+                    matched_any_macro = true;
+                    selector_matches.push((group.id, selector.id));
+                }
+            }
+            for preset in &group.presets {
+                if !preset.enabled {
+                    continue;
+                }
+                if let Some(hotkey) = preset.hotkey.as_ref()
+                    && hotkey::binding_matches(
+                        hotkey,
+                        &binding.key,
+                        binding.ctrl,
+                        binding.alt,
+                        binding.shift,
+                        binding.win,
+                )
+                {
+                    matched_any_macro = true;
+                    if preset.trigger_mode == MacroTriggerMode::Hold {
+                        if !hook_state.active_hold_macros.contains_key(&preset.id) {
+                            hold_matches.push((
+                                preset.clone(),
+                                hotkey.clone(),
+                                group.target_window_title.clone(),
+                                group.extra_target_window_titles.clone(),
+                                group.match_duplicate_window_titles,
+                                binding.key.clone(),
+                            ));
+                        }
+                        continue;
+                    }
+
+                    if is_repeat {
+                        continue;
+                    }
+
+                    press_matches.push((
+                        preset.clone(),
+                        group.target_window_title.clone(),
+                        group.extra_target_window_titles.clone(),
+                        group.match_duplicate_window_titles,
+                        binding.key.clone(),
+                    ));
+                }
+            }
+        }
+
+        drop(hook_state);
+
+        for (group_id, selector_id) in selector_matches {
+            let _ = activate_selector_prompt(group_id, selector_id);
+        }
+
+        for action in window_actions {
+            match action {
+                WindowHotkeyAction::Apply(preset) => {
+                    let _ = apply_window_preset(&preset);
+                }
+                WindowHotkeyAction::Focus(preset) => {
+                    let _ = focus_window_for_preset(&preset);
+                }
+                WindowHotkeyAction::Animate(preset) => {
+                    thread::spawn(move || {
+                        let _ = apply_window_preset_animated(&preset);
+                    });
+                }
+                WindowHotkeyAction::RestoreTitleBar(preset) => {
+                    let _ = restore_window_title_bar_for_preset(&preset);
+                }
+            }
+        }
+
+        for (preset, trigger, target_window_title, extra_target_window_titles, match_duplicate_window_titles, trigger_key) in hold_matches {
+            activate_hold_macro(
+                preset,
+                trigger,
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+                trigger_key,
+            );
+        }
+
+        for (preset, target_window_title, extra_target_window_titles, match_duplicate_window_titles, trigger_key) in press_matches {
+            let hotkey_id = MACRO_PRESET_BASE_ID + preset.id as i32;
+            if !SUPPRESSED_MACRO_HOTKEYS.lock().contains(&hotkey_id) {
+                let _ = play_macro_preset(
+                    hotkey_id,
+                    preset,
+                    target_window_title,
+                    extra_target_window_titles,
+                    match_duplicate_window_titles,
+                    trigger_key,
+                );
+            } else {
+                STOP_REQUESTED_MACRO_PRESETS.lock().insert(preset.id);
+            }
+        }
+
+        if matched_any_macro {
+            return Some(true);
+        }
+
+        Some(matched_any_window)
+    }
+
+    fn process_binding_release(binding: &HotkeyBinding) -> bool {
+        let preset_ids = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .active_hold_macros
+                .iter()
+                .filter(|(_, active)| {
+                    hotkey::binding_matches(
+                        &active.trigger,
+                        &binding.key,
+                        binding.ctrl,
+                        binding.alt,
+                        binding.shift,
+                        binding.win,
+                    )
+                })
+                .map(|(preset_id, _)| *preset_id)
+                .collect::<Vec<_>>()
+        };
+
+        if preset_ids.is_empty() {
+            return false;
+        }
+
+        for preset_id in preset_ids {
+            deactivate_hold_macro(preset_id);
+        }
+        true
+    }
+
+    fn is_locked_input(key_name: &str) -> bool {
+        HOOK_STATE
+            .lock()
+            .locked_inputs
+            .get(key_name)
+            .copied()
+            .unwrap_or_default()
+            > 0
+    }
+
+    fn update_modifier_state(vk: u32, is_key_down: bool) {
+        let mut hook_state = HOOK_STATE.lock();
+        match vk {
+            0x10 | 0xA0 | 0xA1 => hook_state.shift = is_key_down,
+            0x11 | 0xA2 | 0xA3 => hook_state.ctrl = is_key_down,
+            0x12 | 0xA4 | 0xA5 => hook_state.alt = is_key_down,
+            0x5B | 0x5C => hook_state.win = is_key_down,
+            _ => {}
+        }
+    }
+
+    fn update_held_key(key_name: &str, is_key_down: bool, is_key_up: bool) {
+        let mut hook_state = HOOK_STATE.lock();
+        if is_key_down {
+            hook_state.held_inputs.insert(key_name.to_owned());
+            let ignored_for_stop = hook_state
+                .stop_ignore_keys
+                .values()
+                .any(|ignored| ignored.eq_ignore_ascii_case(key_name));
+            if !ignored_for_stop {
+                hook_state.pressed_inputs.insert(key_name.to_owned());
+            }
+        } else if is_key_up {
+            hook_state.held_inputs.remove(key_name);
+            hook_state
+                .stop_ignore_keys
+                .retain(|_, ignored| !ignored.eq_ignore_ascii_case(key_name));
+        }
+    }
+
+    fn update_held_mouse_button(message: u32, mouse_data: u16) {
+        let key_name = match (message, mouse_data) {
+            (WM_LBUTTONDOWN | WM_LBUTTONUP, _) => Some("MouseLeft"),
+            (WM_RBUTTONDOWN | WM_RBUTTONUP, _) => Some("MouseRight"),
+            (WM_MBUTTONDOWN | windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONUP, _) => {
+                Some("MouseMiddle")
+            }
+            (WM_XBUTTONDOWN | WM_XBUTTONUP, XBUTTON1_DATA) => Some("MouseX1"),
+            (WM_XBUTTONDOWN | WM_XBUTTONUP, XBUTTON2_DATA) => Some("MouseX2"),
+            _ => None,
+        };
+        let Some(key_name) = key_name else {
+            return;
+        };
+        let is_down = matches!(
+            message,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        );
+        let mut hook_state = HOOK_STATE.lock();
+        if is_down {
+            hook_state.held_mouse_buttons.insert(key_name.to_owned());
+        } else {
+            hook_state.held_mouse_buttons.remove(key_name);
+        }
+    }
+
+    fn stop_key_triggered(preset_id: u32, key_name: &str) -> bool {
+        let mut hook_state = HOOK_STATE.lock();
+        if hook_state
+            .stop_ignore_keys
+            .get(&preset_id)
+            .is_some_and(|ignored| ignored.eq_ignore_ascii_case(key_name))
+        {
+            return false;
+        }
+        if let Some(pressed) = hook_state
+            .pressed_inputs
+            .iter()
+            .find(|pressed| pressed.eq_ignore_ascii_case(key_name))
+            .cloned()
+        {
+            hook_state.pressed_inputs.remove(&pressed);
+            return true;
+        }
+        hook_state
+            .held_inputs
+            .iter()
+            .any(|held| held.eq_ignore_ascii_case(key_name))
+    }
+
+    fn is_repeat_key(key_name: &str) -> bool {
+        HOOK_STATE.lock().held_inputs.contains(key_name)
+    }
+
+    fn is_mouse_locked() -> bool {
+        HOOK_STATE.lock().locked_mouse_count > 0
+    }
+
+    unsafe fn runtime_mut(hwnd: HWND) -> Option<&'static mut Runtime> {
+        let ptr = GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_USERDATA.0));
+        if ptr == 0 {
+            None
+        } else {
+            Some(&mut *(ptr as *mut Runtime))
+        }
+    }
+
+    unsafe fn refresh_overlay(runtime: &mut Runtime) -> Result<()> {
+        if !runtime.style.enabled {
+            let _ = ShowWindow(runtime.overlay_hwnd, SW_HIDE);
+            return Ok(());
+        }
+
+        let custom_path = runtime
+            .style
+            .custom_asset
+            .as_ref()
+            .map(|name| runtime.paths.asset_path(name));
+
+        let rendered = render_crosshair(&runtime.style, custom_path.as_deref())?;
+        paint_overlay(runtime.overlay_hwnd, &runtime.style, rendered)?;
+        let _ = ShowWindow(runtime.overlay_hwnd, SW_SHOWNA);
+        Ok(())
+    }
+
+    fn refresh_toolbox(runtime: &mut Runtime) -> Result<()> {
+        let display = {
+            let mut guard = TOOLBOX_DISPLAY.lock();
+            if let Some(active) = guard.as_ref()
+                && let Some(expires_at) = active.expires_at
+                && Instant::now() >= expires_at
+            {
+                *guard = None;
+            }
+            guard.clone()
+        };
+        if runtime.toolbox_display == display {
+            return Ok(());
+        }
+        runtime.toolbox_display = display.clone();
+
+        let Some(display) = display else {
+            let _ = unsafe { ShowWindow(runtime.toolbox_hwnd, SW_HIDE) };
+            return Ok(());
+        };
+
+        unsafe { paint_toolbox(runtime.toolbox_hwnd, &display) }
+    }
+
+    fn refresh_mouse_record_trail(runtime: &mut Runtime) -> Result<()> {
+        let points = {
+            let guard = MOUSE_RECORDING.lock();
+            guard
+                .as_ref()
+                .map(|session| {
+                    session
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event.kind, MousePathEventKind::Move))
+                        .map(|event| POINT {
+                            x: event.x,
+                            y: event.y,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        if points.len() < 2 {
+            unsafe {
+                let _ = ShowWindow(runtime.mouse_trail_hwnd, SW_HIDE);
+            }
+            return Ok(());
+        }
+
+        unsafe { paint_mouse_trail(runtime.mouse_trail_hwnd, &points) }
+    }
+
+    fn refresh_zoom(runtime: &mut Runtime) -> Result<()> {
+        let active = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .active_zoom_preset_id
+                .and_then(|id| hook_state.zoom_presets.iter().find(|preset| preset.id == id).cloned())
+        };
+
+        let Some(preset) = active else {
+            unsafe {
+                let _ = ShowWindow(runtime.zoom_host_hwnd, SW_HIDE);
+            }
+            return Ok(());
+        };
+
+        if !window_focus_matches(
+            preset.target_window_title.as_deref(),
+            &preset.extra_target_window_titles,
+            false,
+        ) {
+            unsafe {
+                let _ = ShowWindow(runtime.zoom_host_hwnd, SW_HIDE);
+            }
+            return Ok(());
+        }
+
+        let fps = preset.fps.max(1);
+        let min_frame = Duration::from_secs_f32(1.0 / fps as f32);
+        if runtime.last_zoom_update.elapsed() < min_frame {
+            return Ok(());
+        }
+        runtime.last_zoom_update = Instant::now();
+
+        let source_width = preset.source_width.max(1);
+        let source_height = preset.source_height.max(1);
+        let target_width = preset.target_width.max(1);
+        let target_height = preset.target_height.max(1);
+        let scale_x = target_width as f32 / source_width as f32;
+        let scale_y = target_height as f32 / source_height as f32;
+        let mut transform = MAGTRANSFORM {
+            v: [scale_x, 0.0, 0.0, 0.0, scale_y, 0.0, 0.0, 0.0, 1.0],
+        };
+        let source = RECT {
+            left: preset.source_x,
+            top: preset.source_y,
+            right: preset.source_x + source_width,
+            bottom: preset.source_y + source_height,
+        };
+
+        unsafe {
+            let _ = SetWindowPos(
+                runtime.zoom_host_hwnd,
+                Some(HWND_TOPMOST),
+                preset.target_x,
+                preset.target_y,
+                target_width,
+                target_height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let _ = SetWindowPos(
+                runtime.zoom_mag_hwnd,
+                None,
+                0,
+                0,
+                target_width,
+                target_height,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            );
+            let _ = MagSetWindowTransform(runtime.zoom_mag_hwnd, &mut transform);
+            let _ = MagSetWindowSource(runtime.zoom_mag_hwnd, source);
+            let _ = ShowWindow(runtime.zoom_host_hwnd, SW_SHOWNA);
+        }
+        Ok(())
+    }
+
+    fn refresh_pin_overlay(runtime: &mut Runtime) -> Result<()> {
+        let active = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .active_pin_preset_id
+                .and_then(|id| hook_state.pin_presets.iter().find(|preset| preset.id == id).cloned())
+        };
+
+        let Some(preset) = active else {
+            unsafe {
+                if let Some(active) = runtime.active_pin_thumbnail.take() {
+                    let _ = DwmUnregisterThumbnail(active.thumbnail_id);
+                }
+                let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
+            }
+            return Ok(());
+        };
+
+        let source = find_target_window_hwnd(
+            preset.target_window_title.as_deref(),
+            &preset.extra_target_window_titles,
+            preset.match_duplicate_window_titles,
+            false,
+        )
+            .context("Pin source window was not found")?;
+        unsafe {
+            let source_root = GetAncestor(source, GA_ROOT);
+            if !source_root.0.is_null() && window_belongs_to_current_process(source_root) && !is_internal_app_window(source_root) {
+                let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
+                return Ok(());
+            }
+
+            let needs_register = runtime
+                .active_pin_thumbnail
+                .as_ref()
+                .is_none_or(|active| active.preset_id != preset.id || active.source_hwnd != source);
+            if needs_register {
+                if let Some(active) = runtime.active_pin_thumbnail.take() {
+                    let _ = DwmUnregisterThumbnail(active.thumbnail_id);
+                }
+                let thumbnail_id = DwmRegisterThumbnail(runtime.pin_hwnd, source)?;
+                runtime.active_pin_thumbnail = Some(ActivePinThumbnail {
+                    preset_id: preset.id,
+                    source_hwnd: source,
+                    thumbnail_id,
+                });
+            }
+
+            let mut source_rect = RECT::default();
+            GetWindowRect(source, &mut source_rect)?;
+            let (target_x, target_y, target_w, target_h) = if preset.use_custom_bounds {
+                (preset.x, preset.y, preset.width.max(1), preset.height.max(1))
+            } else {
+                (
+                    source_rect.left,
+                    source_rect.top,
+                    (source_rect.right - source_rect.left).max(1),
+                    (source_rect.bottom - source_rect.top).max(1),
+                )
+            };
+
+            let _ = SetWindowPos(
+                runtime.pin_hwnd,
+                Some(HWND_TOPMOST),
+                target_x,
+                target_y,
+                target_w,
+                target_h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+
+            if let Some(active) = runtime.active_pin_thumbnail.as_ref() {
+                let mut source_flags = DWM_TNP_SOURCECLIENTAREAONLY;
+                let mut source_rect_crop = RECT::default();
+                if preset.use_source_crop {
+                    let source_width = (source_rect.right - source_rect.left).max(1);
+                    let source_height = (source_rect.bottom - source_rect.top).max(1);
+                    let crop_x = preset.source_x.clamp(0, source_width.saturating_sub(1));
+                    let crop_y = preset.source_y.clamp(0, source_height.saturating_sub(1));
+                    let crop_w = preset
+                        .source_width
+                        .max(1)
+                        .min(source_width.saturating_sub(crop_x).max(1));
+                    let crop_h = preset
+                        .source_height
+                        .max(1)
+                        .min(source_height.saturating_sub(crop_y).max(1));
+                    source_rect_crop = RECT {
+                        left: crop_x,
+                        top: crop_y,
+                        right: crop_x + crop_w,
+                        bottom: crop_y + crop_h,
+                    };
+                    source_flags |= DWM_TNP_RECTSOURCE;
+                }
+                let properties = DWM_THUMBNAIL_PROPERTIES {
+                    dwFlags: DWM_TNP_RECTDESTINATION
+                        | DWM_TNP_VISIBLE
+                        | DWM_TNP_OPACITY
+                        | source_flags,
+                    rcDestination: RECT {
+                        left: 0,
+                        top: 0,
+                        right: target_w,
+                        bottom: target_h,
+                    },
+                    rcSource: source_rect_crop,
+                    opacity: 255,
+                    fVisible: true.into(),
+                    fSourceClientAreaOnly: false.into(),
+                    ..Default::default()
+                };
+                let _ = DwmUpdateThumbnailProperties(active.thumbnail_id, &properties);
+            }
+            let _ = ShowWindow(runtime.pin_hwnd, SW_SHOWNA);
+        }
+        Ok(())
+    }
+
+    unsafe fn paint_toolbox(hwnd: HWND, display: &ToolboxDisplayState) -> Result<()> {
+        let window_x = display.x.max(0);
+        let window_y = display.y.max(0);
+        let width = display.width.max(1);
+        let height = display.height.max(1);
+
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+
+        let bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits_ptr: *mut c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            Some(mem_dc),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut bits_ptr,
+            None,
+            0,
+        )?;
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+
+        let bg_alpha = (display.background_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let bytes_len = (width as usize) * (height as usize) * 4;
+        let pixels = std::slice::from_raw_parts_mut(bits_ptr as *mut u8, bytes_len);
+        let radius = if display.rounded_background { 16.0 } else { 0.0 };
+        let bg_b = ((display.background_color.b as u32 * bg_alpha as u32) / 255) as u8;
+        let bg_g = ((display.background_color.g as u32 * bg_alpha as u32) / 255) as u8;
+        let bg_r = ((display.background_color.r as u32 * bg_alpha as u32) / 255) as u8;
+        for py in 0..height {
+            for px in 0..width {
+                let index = ((py as usize) * (width as usize) + (px as usize)) * 4;
+                let inside = if radius <= 0.0 {
+                    true
+                } else {
+                    let px_f = px as f32 + 0.5;
+                    let py_f = py as f32 + 0.5;
+                    let inner_left = radius;
+                    let inner_right = width as f32 - radius;
+                    let inner_top = radius;
+                    let inner_bottom = height as f32 - radius;
+                    if (px_f >= inner_left && px_f <= inner_right)
+                        || (py_f >= inner_top && py_f <= inner_bottom)
+                    {
+                        true
+                    } else {
+                        let corner_x = if px_f < inner_left {
+                            inner_left
+                        } else {
+                            inner_right
+                        };
+                        let corner_y = if py_f < inner_top {
+                            inner_top
+                        } else {
+                            inner_bottom
+                        };
+                        let dx = px_f - corner_x;
+                        let dy = py_f - corner_y;
+                        (dx * dx) + (dy * dy) <= radius * radius
+                    }
+                };
+                if inside && bg_alpha > 0 {
+                    pixels[index] = bg_b;
+                    pixels[index + 1] = bg_g;
+                    pixels[index + 2] = bg_r;
+                    pixels[index + 3] = bg_alpha;
+                } else {
+                    pixels[index] = 0;
+                    pixels[index + 1] = 0;
+                    pixels[index + 2] = 0;
+                    pixels[index + 3] = 0;
+                }
+            }
+        }
+
+        let font_name = "Segoe UI"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let font = CreateFontW(
+            -(display.font_size.round() as i32).max(1),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,
+            FF_DONTCARE.0 as u32,
+            PCWSTR(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(mem_dc, HGDIOBJ(font.0));
+        let _ = SetBkMode(mem_dc, TRANSPARENT);
+        let _ = SetTextColor(
+            mem_dc,
+            COLORREF(
+                ((display.text_color.b as u32) << 16)
+                    | ((display.text_color.g as u32) << 8)
+                    | (display.text_color.r as u32),
+            ),
+        );
+        let mut text_rect = RECT {
+            left: 12,
+            top: 4,
+            right: width - 12,
+            bottom: height - 4,
+        };
+        let mut wide = display
+            .text
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let _ = DrawTextW(
+            mem_dc,
+            &mut wide,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let text_alpha = display.text_color.a.max(1);
+        for chunk in pixels.chunks_exact_mut(4) {
+            let looks_like_bg =
+                chunk[0] == bg_b && chunk[1] == bg_g && chunk[2] == bg_r && chunk[3] == bg_alpha;
+            let alpha = if looks_like_bg {
+                bg_alpha
+            } else if chunk[0] == 0 && chunk[1] == 0 && chunk[2] == 0 && chunk[3] == 0 {
+                0
+            } else {
+                text_alpha
+            };
+            chunk[3] = alpha;
+            chunk[0] = ((chunk[0] as u32 * alpha as u32) / 255) as u8;
+            chunk[1] = ((chunk[1] as u32 * alpha as u32) / 255) as u8;
+            chunk[2] = ((chunk[2] as u32 * alpha as u32) / 255) as u8;
+        }
+
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let src_pt = POINT { x: 0, y: 0 };
+        let pos = POINT {
+            x: window_x,
+            y: window_y,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            Some(screen_dc),
+            Some(&pos),
+            Some(&size),
+            Some(mem_dc),
+            Some(&src_pt),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        let _ = SelectObject(mem_dc, old_font);
+        let _ = DeleteObject(HGDIOBJ(font.0));
+        let _ = SelectObject(mem_dc, old_bitmap);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        let _ = ShowWindow(hwnd, SW_SHOWNA);
+        Ok(())
+    }
+
+    fn sync_window_hotkeys(hwnd: HWND, runtime: &mut Runtime) -> Result<()> {
+        for hotkey_id in runtime.registered_window_hotkeys.keys().copied().collect::<Vec<_>>() {
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), hotkey_id) };
+        }
+        runtime.registered_window_hotkeys.clear();
+        let mut hook_state = HOOK_STATE.lock();
+        hook_state.window_presets = runtime.window_presets.clone();
+        hook_state.window_focus_presets = runtime.window_focus_presets.clone();
+        hook_state.pin_presets = runtime.pin_presets.clone();
+        Ok(())
+    }
+
+    fn sync_macro_hotkeys(hwnd: HWND, runtime: &mut Runtime) -> Result<()> {
+        for hotkey_id in runtime.registered_macro_hotkeys.keys().copied().collect::<Vec<_>>() {
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), hotkey_id) };
+        }
+        runtime.registered_macro_hotkeys.clear();
+        HOOK_STATE.lock().macro_groups = runtime.macro_groups.clone();
+        Ok(())
+    }
+
+    fn unregister_all_hotkeys(hwnd: HWND, runtime: Option<&mut Runtime>) {
+        let Some(runtime) = runtime else {
+            return;
+        };
+        let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
+        for hotkey_id in runtime.registered_window_hotkeys.keys().copied().collect::<Vec<_>>() {
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), hotkey_id) };
+        }
+        for hotkey_id in runtime.registered_macro_hotkeys.keys().copied().collect::<Vec<_>>() {
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), hotkey_id) };
+        }
+    }
+
+    fn play_macro_preset(
+        hotkey_id: i32,
+        preset: MacroPreset,
+        target_window_title: Option<String>,
+        extra_target_window_titles: Vec<String>,
+        match_duplicate_window_titles: bool,
+        trigger_key: String,
+    ) -> Result<()> {
+        SUPPRESSED_MACRO_HOTKEYS.lock().insert(hotkey_id);
+        STOP_REQUESTED_MACRO_PRESETS.lock().remove(&preset.id);
+        HOOK_STATE
+            .lock()
+            .stop_ignore_keys
+            .insert(preset.id, trigger_key);
+        thread::spawn(move || {
+            let cleanup_steps = collect_macro_release_steps(&preset.steps);
+            let mut press_locked_keys: Vec<String> = Vec::new();
+            let mut press_locked_mouse_count = 0usize;
+            let _ = execute_macro_sequence(
+                preset.id,
+                &preset.steps,
+                &mut press_locked_keys,
+                &mut press_locked_mouse_count,
+                preset.stop_on_retrigger_immediate,
+                target_window_title.as_deref(),
+                &extra_target_window_titles,
+                match_duplicate_window_titles,
+            );
+            for step in cleanup_steps {
+                let _ = send_key_event(&step);
+            }
+            if !press_locked_keys.is_empty() {
+                apply_unlock_keys(&press_locked_keys, None);
+            }
+            for _ in 0..press_locked_mouse_count {
+                apply_unlock_mouse(None);
+            }
+            hide_toolbox_for_owner(preset.id);
+            HOOK_STATE.lock().stop_ignore_keys.remove(&preset.id);
+            STOP_REQUESTED_MACRO_PRESETS.lock().remove(&preset.id);
+            SUPPRESSED_MACRO_HOTKEYS.lock().remove(&hotkey_id);
+        });
+        Ok(())
+    }
+
+    fn activate_hold_macro(
+        preset: MacroPreset,
+        trigger: HotkeyBinding,
+        target_window_title: Option<String>,
+        extra_target_window_titles: Vec<String>,
+        match_duplicate_window_titles: bool,
+        trigger_key: String,
+    ) {
+        let stale_run_exists = HOOK_STATE.lock().active_hold_macros.contains_key(&preset.id);
+        if stale_run_exists {
+            deactivate_hold_macro(preset.id);
+        }
+        STOP_REQUESTED_MACRO_PRESETS.lock().remove(&preset.id);
+        HOOK_STATE
+            .lock()
+            .stop_ignore_keys
+            .insert(preset.id, trigger_key);
+        let release_steps = collect_macro_release_steps(&preset.steps);
+        let hold_stop_step = preset
+            .hold_stop_step_enabled
+            .then(|| preset.hold_stop_step.clone());
+        let run_token = {
+            let mut hook_state = HOOK_STATE.lock();
+            let run_token = hook_state.next_hold_run_token;
+            hook_state.next_hold_run_token = hook_state.next_hold_run_token.saturating_add(1);
+            hook_state.active_hold_macros.insert(
+                preset.id,
+                ActiveHoldMacro {
+                    trigger,
+                    release_steps,
+                    hold_stop_step,
+                    locked_keys: Vec::new(),
+                    locked_mouse_count: 0,
+                    run_token,
+                    completed: false,
+                },
+            );
+            run_token
+        };
+        thread::spawn(move || {
+            let flow = execute_hold_macro_sequence(
+                preset.id,
+                &preset.steps,
+                preset.stop_on_retrigger_immediate,
+                run_token,
+                target_window_title.as_deref(),
+                &extra_target_window_titles,
+                match_duplicate_window_titles,
+            );
+            if matches!(flow, MacroRunFlow::Continue) {
+                let mut hook_state = HOOK_STATE.lock();
+                if let Some(active) = hook_state.active_hold_macros.get_mut(&preset.id)
+                    && active.run_token == run_token
+                {
+                    active.completed = true;
+                }
+            }
+        });
+    }
+
+    fn deactivate_hold_macro(preset_id: u32) {
+        STOP_REQUESTED_MACRO_PRESETS.lock().insert(preset_id);
+        let active = {
+            let mut hook_state = HOOK_STATE.lock();
+            let Some(active) = hook_state.active_hold_macros.remove(&preset_id) else {
+                return;
+            };
+            active
+        };
+
+        let ActiveHoldMacro {
+            trigger: _,
+            release_steps,
+            hold_stop_step,
+            locked_keys,
+            locked_mouse_count,
+            run_token: _,
+            completed,
+        } = active;
+
+        for step in release_steps {
+            let _ = send_key_event(&step);
+        }
+
+        if !locked_keys.is_empty() {
+            apply_unlock_keys(&locked_keys, Some(preset_id));
+        }
+        for _ in 0..locked_mouse_count {
+            apply_unlock_mouse(Some(preset_id));
+        }
+
+        if !completed {
+            if let Some(step) = hold_stop_step {
+                execute_hold_abort_step(preset_id, &step);
+            }
+        }
+
+        hide_toolbox_for_owner(preset_id);
+        HOOK_STATE.lock().stop_ignore_keys.remove(&preset_id);
+    }
+
+    fn current_hold_run_matches(preset_id: u32, run_token: u64) -> bool {
+        HOOK_STATE
+            .lock()
+            .active_hold_macros
+            .get(&preset_id)
+            .is_some_and(|active| active.run_token == run_token)
+    }
+
+    fn send_overlay_command(command: OverlayCommand) {
+        if let Some(tx) = OVERLAY_COMMAND_TX.lock().clone() {
+            let _ = tx.send(command);
+        }
+    }
+
+    fn apply_window_preset_by_id(spec: &str) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Window preset id is invalid")?;
+        let mut preset = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .window_presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .cloned()
+        }
+        .context("Window preset was not found")?;
+        preset.enabled = true;
+        apply_window_preset(&preset)
+    }
+
+    fn focus_window_by_preset_id(spec: &str) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Window preset id is invalid")?;
+        let preset = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .window_focus_presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .cloned()
+        }
+        .context("Window preset was not found")?;
+        focus_window_for_title(
+            preset.target_window_title.as_deref(),
+            &preset.extra_target_window_titles,
+            preset.match_duplicate_window_titles,
+            true,
+        )
+    }
+
+    fn focus_window_for_preset(preset: &WindowFocusPreset) -> Result<()> {
+        focus_window_for_title(
+            preset.target_window_title.as_deref(),
+            &preset.extra_target_window_titles,
+            preset.match_duplicate_window_titles,
+            true,
+        )
+    }
+
+    fn focus_window_for_title(
+        target_title: Option<&str>,
+        extra_target_titles: &[String],
+        match_duplicate_window_titles: bool,
+        prefer_other_if_foreground_matches: bool,
+    ) -> Result<()> {
+        let hwnd = find_target_window_hwnd(
+            target_title,
+            extra_target_titles,
+            match_duplicate_window_titles,
+            prefer_other_if_foreground_matches,
+        )
+            .context("Target window was not found")?;
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground == hwnd && !IsIconic(hwnd).as_bool() {
+                return Ok(());
+            }
+            let current_thread = GetCurrentThreadId();
+            let target_thread = GetWindowThreadProcessId(hwnd, None);
+            let foreground_thread = if foreground.0.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, None)
+            };
+
+            let attach_foreground = foreground_thread != 0 && foreground_thread != current_thread;
+            let attach_target = target_thread != 0 && target_thread != current_thread;
+
+            if attach_foreground {
+                let _ = AttachThreadInput(foreground_thread, current_thread, true);
+            }
+            if attach_target {
+                let _ = AttachThreadInput(target_thread, current_thread, true);
+            }
+
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+            thread::sleep(Duration::from_millis(18));
+            replay_held_inputs_after_focus();
+
+            if attach_target {
+                let _ = AttachThreadInput(target_thread, current_thread, false);
+            }
+            if attach_foreground {
+                let _ = AttachThreadInput(foreground_thread, current_thread, false);
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_held_inputs_after_focus() {
+        let held_keys = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .held_inputs
+                .iter()
+                .filter(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "Ctrl" | "Alt" | "Shift" | "Win" | "Tab" | "MouseLeft" | "MouseRight"
+                            | "MouseMiddle" | "MouseX1" | "MouseX2"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for key in held_keys {
+            let _ = send_key_event(&MacroStep {
+                action: MacroAction::KeyDown,
+                key,
+                ..MacroStep::default()
+            });
+        }
+    }
+
+    fn macro_stop_requested(preset_id: u32, stop_immediately_on_retrigger: bool) -> bool {
+        stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id)
+    }
+
+    fn sleep_for_mouse_path_delay(
+        preset_id: Option<u32>,
+        delay_ms: u64,
+        stop_immediately_on_retrigger: bool,
+    ) -> bool {
+        if delay_ms == 0 {
+            return preset_id
+                .is_some_and(|id| macro_stop_requested(id, stop_immediately_on_retrigger));
+        }
+        let mut remaining_ms = delay_ms;
+        while remaining_ms > 0 {
+            if preset_id.is_some_and(|id| macro_stop_requested(id, stop_immediately_on_retrigger)) {
+                return true;
+            }
+            let chunk_ms = remaining_ms.min(10);
+            thread::sleep(Duration::from_millis(chunk_ms));
+            remaining_ms = remaining_ms.saturating_sub(chunk_ms);
+        }
+        preset_id.is_some_and(|id| macro_stop_requested(id, stop_immediately_on_retrigger))
+    }
+
+    fn enable_crosshair_profile(spec: &str) -> Result<()> {
+        let profile_name = spec.trim();
+        if profile_name.is_empty() {
+            bail!("Crosshair profile name is empty");
+        }
+        let profile = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .profiles
+                .iter()
+                .find(|profile| profile.name == profile_name)
+                .cloned()
+        }
+        .context("Crosshair profile was not found")?;
+        let mut style = profile.style;
+        style.enabled = true;
+        HOOK_STATE.lock().current_style = style.clone();
+        send_overlay_command(OverlayCommand::Update(style));
+        Ok(())
+    }
+
+    fn disable_crosshair_overlay() {
+        let mut style = HOOK_STATE.lock().current_style.clone();
+        style.enabled = false;
+        HOOK_STATE.lock().current_style = style.clone();
+        send_overlay_command(OverlayCommand::Update(style));
+    }
+
+    fn enable_pin_preset(spec: &str) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Pin preset id is invalid")?;
+        let mut hook_state = HOOK_STATE.lock();
+        if !hook_state.pin_presets.iter().any(|preset| preset.id == preset_id) {
+            bail!("Pin preset was not found");
+        }
+        hook_state.active_pin_preset_id = Some(preset_id);
+        Ok(())
+    }
+
+    fn disable_pin_overlay() {
+        HOOK_STATE.lock().active_pin_preset_id = None;
+    }
+
+    fn play_sound_preset(spec: &str) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Sound preset id is invalid")?;
+        let clips = {
+            let hook_state = HOOK_STATE.lock();
+            let preset = hook_state
+                .sound_presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .cloned()
+                .context("Sound preset was not found")?;
+            let mut base_clip = preset.clip.clone();
+            base_clip.enabled = true;
+            let mut clips = vec![base_clip];
+            for library_id in &preset.sequence_library_ids {
+                if let Some(item) = hook_state
+                    .sound_library
+                    .iter()
+                    .find(|item| item.id == *library_id)
+                {
+                    let mut clip = item.clip.clone();
+                    clip.enabled = true;
+                    clips.push(clip);
+                }
+            }
+            clips
+        };
+        audio::play_clip_sequence_async(clips);
+        Ok(())
+    }
+
+    fn play_mouse_path_preset(
+        spec: &str,
+        step: &MacroStep,
+        preset_id: Option<u32>,
+        stop_immediately_on_retrigger: bool,
+    ) -> Result<()> {
+        let mouse_path_preset_id = spec
+            .trim()
+            .parse::<u32>()
+            .context("Mouse path preset id is invalid")?;
+        let events = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .mouse_path_presets
+                .iter()
+                .find(|preset| preset.id == mouse_path_preset_id)
+                .map(|preset| preset.events.clone())
+                .context("Mouse path preset was not found")?
+        };
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        if step.smooth_mouse_path {
+            let speed = step.mouse_speed_percent.max(10) as f32 / 100.0;
+            let mut last_pos: Option<(i32, i32)> = None;
+            for event in &events {
+                if preset_id.is_some_and(|id| macro_stop_requested(id, stop_immediately_on_retrigger)) {
+                    return Ok(());
+                }
+                match event.kind {
+                    MousePathEventKind::Move => {
+                        if let Some((from_x, from_y)) = last_pos {
+                            let dx = event.x - from_x;
+                            let dy = event.y - from_y;
+                            let distance =
+                                (((dx * dx + dy * dy) as f32).sqrt()).max(1.0);
+                            let duration_ms = ((distance / (900.0 * speed)) * 1000.0)
+                                .round()
+                                .clamp(1.0, 5_000.0) as u64;
+                            let steps = (duration_ms / 8).max(1);
+                            for index in 1..=steps {
+                                if preset_id.is_some_and(|id| macro_stop_requested(id, stop_immediately_on_retrigger)) {
+                                    return Ok(());
+                                }
+                                let t = index as f32 / steps as f32;
+                                let x = from_x as f32 + dx as f32 * t;
+                                let y = from_y as f32 + dy as f32 * t;
+                                send_mouse_move_absolute(x.round() as i32, y.round() as i32)?;
+                                if sleep_for_mouse_path_delay(preset_id, 8, stop_immediately_on_retrigger) {
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            send_mouse_move_absolute(event.x, event.y)?;
+                        }
+                        last_pos = Some((event.x, event.y));
+                    }
+                    _ => {
+                        if sleep_for_mouse_path_delay(preset_id, event.delay_ms, stop_immediately_on_retrigger) {
+                            return Ok(());
+                        }
+                        let pseudo_step = MacroStep {
+                            action: match event.kind {
+                                MousePathEventKind::LeftDown => MacroAction::MouseLeftDown,
+                                MousePathEventKind::LeftUp => MacroAction::MouseLeftUp,
+                                MousePathEventKind::RightDown => MacroAction::MouseRightDown,
+                                MousePathEventKind::RightUp => MacroAction::MouseRightUp,
+                                MousePathEventKind::MiddleDown => MacroAction::MouseMiddleDown,
+                                MousePathEventKind::MiddleUp => MacroAction::MouseMiddleUp,
+                                MousePathEventKind::WheelUp => MacroAction::MouseWheelUp,
+                                MousePathEventKind::WheelDown => MacroAction::MouseWheelDown,
+                                MousePathEventKind::Move => MacroAction::MouseMoveAbsolute,
+                            },
+                            x: event.x,
+                            y: event.y,
+                            ..MacroStep::default()
+                        };
+                        send_mouse_event(&pseudo_step)?;
+                    }
+                }
+            }
+        } else {
+            for event in &events {
+                if sleep_for_mouse_path_delay(preset_id, event.delay_ms, stop_immediately_on_retrigger) {
+                    return Ok(());
+                }
+                let pseudo_step = MacroStep {
+                    action: match event.kind {
+                        MousePathEventKind::Move => MacroAction::MouseMoveAbsolute,
+                        MousePathEventKind::LeftDown => MacroAction::MouseLeftDown,
+                        MousePathEventKind::LeftUp => MacroAction::MouseLeftUp,
+                        MousePathEventKind::RightDown => MacroAction::MouseRightDown,
+                        MousePathEventKind::RightUp => MacroAction::MouseRightUp,
+                        MousePathEventKind::MiddleDown => MacroAction::MouseMiddleDown,
+                        MousePathEventKind::MiddleUp => MacroAction::MouseMiddleUp,
+                        MousePathEventKind::WheelUp => MacroAction::MouseWheelUp,
+                        MousePathEventKind::WheelDown => MacroAction::MouseWheelDown,
+                    },
+                    x: event.x,
+                    y: event.y,
+                    ..MacroStep::default()
+                };
+                send_mouse_event(&pseudo_step)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enable_zoom_preset(spec: &str) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Zoom preset id is invalid")?;
+        let mut hook_state = HOOK_STATE.lock();
+        if !hook_state.zoom_presets.iter().any(|preset| preset.id == preset_id) {
+            bail!("Zoom preset was not found");
+        }
+        hook_state.active_zoom_preset_id = Some(preset_id);
+        Ok(())
+    }
+
+    fn disable_zoom_overlay() {
+        HOOK_STATE.lock().active_zoom_preset_id = None;
+    }
+
+    fn set_macro_preset_enabled(spec: &str, enabled: bool) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Macro preset id is invalid")?;
+        let mut hook_state = HOOK_STATE.lock();
+        for group in &mut hook_state.macro_groups {
+            if let Some(preset) = group.presets.iter_mut().find(|preset| preset.id == preset_id) {
+                preset.enabled = enabled;
+                return Ok(());
+            }
+        }
+        bail!("Macro preset was not found")
+    }
+
+    fn activate_selector_prompt(group_id: u32, selector_id: u32) -> Result<()> {
+        let pending = {
+            let hook_state = HOOK_STATE.lock();
+            let group = hook_state
+                .macro_groups
+                .iter()
+                .find(|group| group.id == group_id)
+                .context("Macro group was not found")?;
+            let selector = group
+                .selector_presets
+                .iter()
+                .find(|selector| selector.id == selector_id)
+                .cloned()
+                .context("Selector preset was not found")?;
+            PendingMacroSelector {
+                group_id,
+                selector_id,
+                prompt_text: selector.prompt_text.clone(),
+                options: selector
+                    .options
+                    .iter()
+                    .map(|option| PendingSelectorOption {
+                        option_id: option.id,
+                        choice_key: option.choice_key.clone(),
+                        enable_preset_ids: option.enable_preset_ids.clone(),
+                        disable_preset_ids: option.disable_preset_ids.clone(),
+                        toolbox_text: option.toolbox_text.clone(),
+                    })
+                    .collect(),
+            }
+        };
+        HOOK_STATE.lock().pending_selector = Some(pending.clone());
+        let prompt = if pending.prompt_text.trim().is_empty() {
+            "Choose an option".to_owned()
+        } else {
+            pending.prompt_text
+        };
+        show_selector_toolbox_message(prompt);
+        Ok(())
+    }
+
+    fn apply_selector_choice(binding_key: &str) -> Result<bool> {
+        let pending = HOOK_STATE.lock().pending_selector.clone();
+        let Some(pending) = pending else {
+            return Ok(false);
+        };
+        let Some(option) = pending
+            .options
+            .iter()
+            .find(|option| option.choice_key.eq_ignore_ascii_case(binding_key))
+            .cloned() else {
+            return Ok(false);
+        };
+
+        let mut status = "Selector choice applied.".to_owned();
+        let updated_groups = {
+            let mut hook_state = HOOK_STATE.lock();
+            let group = hook_state
+                .macro_groups
+                .iter_mut()
+                .find(|group| group.id == pending.group_id)
+                .context("Macro group was not found")?;
+            for selector in &mut group.selector_presets {
+                if selector.id == pending.selector_id {
+                    selector.active_option_id = Some(option.option_id);
+                }
+            }
+            for preset in &mut group.presets {
+                if option.enable_preset_ids.contains(&preset.id) {
+                    preset.enabled = true;
+                }
+                if option.disable_preset_ids.contains(&preset.id) {
+                    preset.enabled = false;
+                }
+            }
+            let enabled_labels = option
+                .enable_preset_ids
+                .iter()
+                .filter_map(|id| {
+                    group.presets
+                        .iter()
+                        .find(|preset| preset.id == *id)
+                        .map(|preset| hotkey::format_binding(preset.hotkey.as_ref()))
+                })
+                .collect::<Vec<_>>();
+            if !enabled_labels.is_empty() {
+                status = format!("Selected {} in {}.", enabled_labels.join(", "), group.name);
+            }
+            hook_state.pending_selector = None;
+            hook_state.macro_groups.clone()
+        };
+
+        let message = if option.toolbox_text.trim().is_empty() {
+            status.clone()
+        } else {
+            option.toolbox_text.clone()
+        };
+        show_selector_toolbox_message(message);
+        if let Some(tx) = HOOK_STATE.lock().ui_tx.clone() {
+            let _ = tx.send(UiCommand::SyncMacroGroups(updated_groups, status));
+        }
+        Ok(true)
+    }
+
+    fn show_selector_toolbox_message(text: String) {
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        *TOOLBOX_DISPLAY.lock() = Some(ToolboxDisplayState {
+            owner_preset_id: None,
+            preset_id: None,
+            text: trimmed,
+            text_color: RgbaColor {
+                r: 244,
+                g: 244,
+                b: 244,
+                a: 255,
+            },
+            background_color: RgbaColor {
+                r: 34,
+                g: 34,
+                b: 34,
+                a: 255,
+            },
+            background_opacity: 0.78,
+            rounded_background: true,
+            font_size: 28.0,
+            x: 660,
+            y: 36,
+            width: 600,
+            height: 80,
+            auto_hide_on_owner_completion: false,
+            expires_at: Some(Instant::now() + Duration::from_millis(1800)),
+        });
+    }
+
+    fn execute_hold_abort_step(
+        preset_id: u32,
+        step: &MacroStep,
+    ) {
+        match step.action {
+            MacroAction::LoopStart
+            | MacroAction::LoopEnd
+            | MacroAction::StopIfTriggerPressedAgain
+            | MacroAction::StopIfKeyPressed => {}
+            MacroAction::ApplyWindowPreset => {
+                let _ = apply_window_preset_by_id(&step.key);
+            }
+            MacroAction::FocusWindowPreset => {
+                let _ = focus_window_by_preset_id(&step.key);
+            }
+            MacroAction::TriggerMacroPreset => {
+                let mut no_locked_keys = Vec::new();
+                let mut no_locked_mouse = 0usize;
+                let _ = trigger_nested_macro_preset(
+                    &step.key,
+                    &mut no_locked_keys,
+                    &mut no_locked_mouse,
+                    false,
+                    None,
+                    &[],
+                    false,
+                );
+            }
+            MacroAction::EnableCrosshairProfile => {
+                let _ = enable_crosshair_profile(&step.key);
+            }
+            MacroAction::DisableCrosshair => {
+                disable_crosshair_overlay();
+            }
+            MacroAction::EnablePinPreset => {
+                let _ = enable_pin_preset(&step.key);
+            }
+            MacroAction::DisablePin => {
+                disable_pin_overlay();
+            }
+            MacroAction::PlayMousePathPreset => {
+                let _ = play_mouse_path_preset(&step.key, step, Some(preset_id), false);
+            }
+            MacroAction::EnableZoomPreset => {
+                let _ = enable_zoom_preset(&step.key);
+            }
+            MacroAction::DisableZoom => {
+                disable_zoom_overlay();
+            }
+            MacroAction::PlaySoundPreset => {
+                let _ = play_sound_preset(&step.key);
+            }
+            MacroAction::ShowToolbox => {
+                trigger_toolbox_display(preset_id, step);
+            }
+            MacroAction::HideToolbox => {
+                hide_toolbox_now();
+            }
+            MacroAction::LockKeys => {
+                apply_lock_keys(&parse_locked_keys(&step.key), Some(preset_id));
+            }
+            MacroAction::UnlockKeys => {
+                apply_unlock_keys(&parse_locked_keys(&step.key), Some(preset_id));
+            }
+            MacroAction::LockMouse => {
+                apply_lock_mouse(Some(preset_id));
+            }
+            MacroAction::UnlockMouse => {
+                apply_unlock_mouse(Some(preset_id));
+            }
+            MacroAction::EnableMacroPreset => {
+                let _ = set_macro_preset_enabled(&step.key, true);
+            }
+            MacroAction::DisableMacroPreset => {
+                let _ = set_macro_preset_enabled(&step.key, false);
+            }
+            _ => {
+                let _ = send_key_event(step);
+            }
+        }
+    }
+
+    fn execute_macro_sequence(
+        preset_id: u32,
+        steps: &[MacroStep],
+        press_locked_keys: &mut Vec<String>,
+        press_locked_mouse_count: &mut usize,
+        stop_immediately_on_retrigger: bool,
+        target_window_title: Option<&str>,
+        extra_target_window_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> MacroRunFlow {
+        let mut index = 0usize;
+        while index < steps.len() {
+            if !macro_runtime_target_matches(
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            ) {
+                return MacroRunFlow::StopExecution;
+            }
+            if stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id) {
+                return MacroRunFlow::StopExecution;
+            }
+            let step = &steps[index];
+            if sleep_for_macro_delay(
+                preset_id,
+                step.delay_ms,
+                stop_immediately_on_retrigger,
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            ) {
+                return MacroRunFlow::StopExecution;
+            }
+            match step.action {
+                MacroAction::LoopStart => {
+                    let Some(loop_end) = find_matching_loop_end(steps, index) else {
+                        index += 1;
+                        continue;
+                    };
+                    let loop_body = &steps[index + 1..loop_end];
+                    if is_infinite_loop_marker(&step.key) {
+                        loop {
+                            match execute_macro_sequence(
+                                preset_id,
+                                loop_body,
+                                press_locked_keys,
+                                press_locked_mouse_count,
+                                stop_immediately_on_retrigger,
+                                target_window_title,
+                                extra_target_window_titles,
+                                match_duplicate_window_titles,
+                            ) {
+                                MacroRunFlow::BreakLoop => break,
+                                MacroRunFlow::StopExecution => return MacroRunFlow::StopExecution,
+                                MacroRunFlow::Continue => {}
+                            }
+                        }
+                    } else {
+                        let loop_count = step.key.trim().parse::<u32>().unwrap_or(1).max(1);
+                        for _ in 0..loop_count {
+                            match execute_macro_sequence(
+                                preset_id,
+                                loop_body,
+                                press_locked_keys,
+                                press_locked_mouse_count,
+                                stop_immediately_on_retrigger,
+                                target_window_title,
+                                extra_target_window_titles,
+                                match_duplicate_window_titles,
+                            ) {
+                                MacroRunFlow::BreakLoop => break,
+                                MacroRunFlow::StopExecution => return MacroRunFlow::StopExecution,
+                                MacroRunFlow::Continue => {}
+                            }
+                        }
+                    }
+                    index = loop_end + 1;
+                    continue;
+                }
+                MacroAction::LoopEnd => return MacroRunFlow::Continue,
+                MacroAction::StopIfTriggerPressedAgain => {
+                    if STOP_REQUESTED_MACRO_PRESETS.lock().remove(&preset_id) {
+                        return MacroRunFlow::BreakLoop;
+                    }
+                }
+                MacroAction::StopIfKeyPressed => {
+                    let key = normalize_locked_key(&step.key);
+                    if stop_key_triggered(preset_id, &key) {
+                        return MacroRunFlow::BreakLoop;
+                    }
+                }
+                MacroAction::ApplyWindowPreset => {
+                    let _ = apply_window_preset_by_id(&step.key);
+                }
+                MacroAction::FocusWindowPreset => {
+                    let _ = focus_window_by_preset_id(&step.key);
+                }
+                MacroAction::TriggerMacroPreset => {
+                    let _ = trigger_nested_macro_preset(
+                        &step.key,
+                        press_locked_keys,
+                        press_locked_mouse_count,
+                        stop_immediately_on_retrigger,
+                        target_window_title,
+                        extra_target_window_titles,
+                        match_duplicate_window_titles,
+                    );
+                }
+                MacroAction::EnableCrosshairProfile => {
+                    let _ = enable_crosshair_profile(&step.key);
+                }
+                MacroAction::DisableCrosshair => {
+                    disable_crosshair_overlay();
+                }
+                MacroAction::EnablePinPreset => {
+                    let _ = enable_pin_preset(&step.key);
+                }
+                MacroAction::DisablePin => {
+                    disable_pin_overlay();
+                }
+                MacroAction::PlayMousePathPreset => {
+                    let _ = play_mouse_path_preset(
+                        &step.key,
+                        step,
+                        Some(preset_id),
+                        stop_immediately_on_retrigger,
+                    );
+                }
+                MacroAction::EnableZoomPreset => {
+                    let _ = enable_zoom_preset(&step.key);
+                }
+                MacroAction::DisableZoom => {
+                    disable_zoom_overlay();
+                }
+                MacroAction::PlaySoundPreset => {
+                    let _ = play_sound_preset(&step.key);
+                }
+                MacroAction::ShowToolbox => {
+                    trigger_toolbox_display(preset_id, step);
+                }
+                MacroAction::HideToolbox => {
+                    hide_toolbox_now();
+                }
+                MacroAction::LockKeys => {
+                    let keys = parse_locked_keys(&step.key);
+                    for key in &keys {
+                        if !press_locked_keys
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(key))
+                        {
+                            press_locked_keys.push(key.clone());
+                        }
+                    }
+                    apply_lock_keys(&keys, None);
+                }
+                MacroAction::UnlockKeys => {
+                    let keys = parse_locked_keys(&step.key);
+                    apply_unlock_keys(&keys, None);
+                    press_locked_keys
+                        .retain(|locked| !keys.iter().any(|key| key.eq_ignore_ascii_case(locked)));
+                }
+                MacroAction::LockMouse => {
+                    apply_lock_mouse(None);
+                    *press_locked_mouse_count = press_locked_mouse_count.saturating_add(1);
+                }
+                MacroAction::UnlockMouse => {
+                    if *press_locked_mouse_count > 0 {
+                        *press_locked_mouse_count -= 1;
+                    }
+                    apply_unlock_mouse(None);
+                }
+                MacroAction::EnableMacroPreset => {
+                    let _ = set_macro_preset_enabled(&step.key, true);
+                }
+                MacroAction::DisableMacroPreset => {
+                    let _ = set_macro_preset_enabled(&step.key, false);
+                }
+                _ => {
+                    let _ = send_key_event(step);
+                }
+            }
+            index += 1;
+        }
+        MacroRunFlow::Continue
+    }
+
+    fn execute_hold_macro_sequence(
+        preset_id: u32,
+        steps: &[MacroStep],
+        stop_immediately_on_retrigger: bool,
+        run_token: u64,
+        target_window_title: Option<&str>,
+        extra_target_window_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> MacroRunFlow {
+        let mut index = 0usize;
+        while index < steps.len() {
+            if !current_hold_run_matches(preset_id, run_token) {
+                return MacroRunFlow::StopExecution;
+            }
+            if !macro_runtime_target_matches(
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            ) {
+                return MacroRunFlow::StopExecution;
+            }
+            if stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id) {
+                return MacroRunFlow::StopExecution;
+            }
+            let step = &steps[index];
+            if sleep_for_hold_delay(
+                preset_id,
+                step.delay_ms,
+                stop_immediately_on_retrigger,
+                run_token,
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            ) {
+                return MacroRunFlow::StopExecution;
+            }
+            match step.action {
+                MacroAction::LoopStart => {
+                    let Some(loop_end) = find_matching_loop_end(steps, index) else {
+                        index += 1;
+                        continue;
+                    };
+                    let loop_body = &steps[index + 1..loop_end];
+                    if is_infinite_loop_marker(&step.key) {
+                        loop {
+                            match execute_hold_macro_sequence(
+                                preset_id,
+                                loop_body,
+                                stop_immediately_on_retrigger,
+                                run_token,
+                                target_window_title,
+                                extra_target_window_titles,
+                                match_duplicate_window_titles,
+                            ) {
+                                MacroRunFlow::BreakLoop => break,
+                                MacroRunFlow::StopExecution => return MacroRunFlow::StopExecution,
+                                MacroRunFlow::Continue => {}
+                            }
+                        }
+                    } else {
+                        let loop_count = step.key.trim().parse::<u32>().unwrap_or(1).max(1);
+                        for _ in 0..loop_count {
+                            match execute_hold_macro_sequence(
+                                preset_id,
+                                loop_body,
+                                stop_immediately_on_retrigger,
+                                run_token,
+                                target_window_title,
+                                extra_target_window_titles,
+                                match_duplicate_window_titles,
+                            ) {
+                                MacroRunFlow::BreakLoop => break,
+                                MacroRunFlow::StopExecution => return MacroRunFlow::StopExecution,
+                                MacroRunFlow::Continue => {}
+                            }
+                        }
+                    }
+                    index = loop_end + 1;
+                    continue;
+                }
+                MacroAction::LoopEnd => return MacroRunFlow::Continue,
+                MacroAction::StopIfTriggerPressedAgain => {
+                    if STOP_REQUESTED_MACRO_PRESETS.lock().remove(&preset_id) {
+                        return MacroRunFlow::BreakLoop;
+                    }
+                }
+                MacroAction::StopIfKeyPressed => {
+                    let key = normalize_locked_key(&step.key);
+                    if stop_key_triggered(preset_id, &key) {
+                        return MacroRunFlow::BreakLoop;
+                    }
+                }
+                MacroAction::ApplyWindowPreset => {
+                    let _ = apply_window_preset_by_id(&step.key);
+                }
+                MacroAction::FocusWindowPreset => {
+                    let _ = focus_window_by_preset_id(&step.key);
+                }
+                MacroAction::TriggerMacroPreset => {
+                    let mut no_locked_keys = Vec::new();
+                    let mut no_locked_mouse = 0usize;
+                    let _ = trigger_nested_macro_preset(
+                        &step.key,
+                        &mut no_locked_keys,
+                        &mut no_locked_mouse,
+                        stop_immediately_on_retrigger,
+                        target_window_title,
+                        extra_target_window_titles,
+                        match_duplicate_window_titles,
+                    );
+                }
+                MacroAction::EnableCrosshairProfile => {
+                    let _ = enable_crosshair_profile(&step.key);
+                }
+                MacroAction::DisableCrosshair => {
+                    disable_crosshair_overlay();
+                }
+                MacroAction::EnablePinPreset => {
+                    let _ = enable_pin_preset(&step.key);
+                }
+                MacroAction::DisablePin => {
+                    disable_pin_overlay();
+                }
+                MacroAction::PlayMousePathPreset => {
+                    let _ = play_mouse_path_preset(
+                        &step.key,
+                        step,
+                        Some(preset_id),
+                        stop_immediately_on_retrigger,
+                    );
+                }
+                MacroAction::EnableZoomPreset => {
+                    let _ = enable_zoom_preset(&step.key);
+                }
+                MacroAction::DisableZoom => {
+                    disable_zoom_overlay();
+                }
+                MacroAction::PlaySoundPreset => {
+                    let _ = play_sound_preset(&step.key);
+                }
+                MacroAction::ShowToolbox => {
+                    trigger_toolbox_display(preset_id, step);
+                }
+                MacroAction::HideToolbox => {
+                    hide_toolbox_now();
+                }
+                MacroAction::LockKeys => {
+                    apply_lock_keys(&parse_locked_keys(&step.key), Some(preset_id));
+                }
+                MacroAction::UnlockKeys => {
+                    apply_unlock_keys(&parse_locked_keys(&step.key), Some(preset_id));
+                }
+                MacroAction::LockMouse => {
+                    apply_lock_mouse(Some(preset_id));
+                }
+                MacroAction::UnlockMouse => {
+                    apply_unlock_mouse(Some(preset_id));
+                }
+                MacroAction::EnableMacroPreset => {
+                    let _ = set_macro_preset_enabled(&step.key, true);
+                }
+                MacroAction::DisableMacroPreset => {
+                    let _ = set_macro_preset_enabled(&step.key, false);
+                }
+                _ => {
+                    let _ = send_key_event(step);
+                }
+            }
+            index += 1;
+        }
+        MacroRunFlow::Continue
+    }
+
+    fn sleep_for_hold_delay(
+        preset_id: u32,
+        delay_ms: u64,
+        stop_immediately_on_retrigger: bool,
+        run_token: u64,
+        target_window_title: Option<&str>,
+        extra_target_window_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> bool {
+        if delay_ms == 0 {
+            return !macro_runtime_target_matches(
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            )
+                || !current_hold_run_matches(preset_id, run_token)
+                || (stop_immediately_on_retrigger
+                    && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id));
+        }
+
+        let mut remaining_ms = delay_ms;
+        while remaining_ms > 0 {
+            if !current_hold_run_matches(preset_id, run_token) {
+                return true;
+            }
+            if !macro_runtime_target_matches(
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            ) {
+                return true;
+            }
+            if stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id) {
+                return true;
+            }
+            let chunk_ms = remaining_ms.min(10);
+            thread::sleep(std::time::Duration::from_millis(chunk_ms));
+            remaining_ms = remaining_ms.saturating_sub(chunk_ms);
+        }
+        !macro_runtime_target_matches(
+            target_window_title,
+            extra_target_window_titles,
+            match_duplicate_window_titles,
+        )
+            || !current_hold_run_matches(preset_id, run_token)
+            || (stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id))
+    }
+
+    fn sleep_for_macro_delay(
+        preset_id: u32,
+        delay_ms: u64,
+        stop_immediately_on_retrigger: bool,
+        target_window_title: Option<&str>,
+        extra_target_window_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> bool {
+        if delay_ms == 0 {
+            return !macro_runtime_target_matches(
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            );
+        }
+
+        let mut remaining_ms = delay_ms;
+        while remaining_ms > 0 {
+            if !macro_runtime_target_matches(
+                target_window_title,
+                extra_target_window_titles,
+                match_duplicate_window_titles,
+            ) {
+                return true;
+            }
+            if stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id) {
+                return true;
+            }
+            let chunk_ms = remaining_ms.min(10);
+            thread::sleep(std::time::Duration::from_millis(chunk_ms));
+            remaining_ms = remaining_ms.saturating_sub(chunk_ms);
+        }
+        !macro_runtime_target_matches(
+            target_window_title,
+            extra_target_window_titles,
+            match_duplicate_window_titles,
+        )
+            || (stop_immediately_on_retrigger
+                && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id))
+    }
+
+    fn find_matching_loop_end(steps: &[MacroStep], start_index: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, step) in steps.iter().enumerate().skip(start_index) {
+            match step.action {
+                MacroAction::LoopStart => depth += 1,
+                MacroAction::LoopEnd => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn is_infinite_loop_marker(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "infinite" | "inf" | "forever" | "-1"
+        )
+    }
+
+    fn macro_runtime_target_matches(
+        target_window_title: Option<&str>,
+        extra_target_window_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> bool {
+        window_focus_matches(
+            target_window_title,
+            extra_target_window_titles,
+            match_duplicate_window_titles,
+        )
+    }
+
+    fn trigger_nested_macro_preset(
+        spec: &str,
+        press_locked_keys: &mut Vec<String>,
+        press_locked_mouse_count: &mut usize,
+        stop_immediately_on_retrigger: bool,
+        target_window_title: Option<&str>,
+        extra_target_window_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> Result<()> {
+        let preset_id = spec.trim().parse::<u32>().context("Macro preset id is invalid")?;
+        let preset = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .macro_groups
+                .iter()
+                .flat_map(|group| group.presets.iter())
+                .find(|preset| preset.id == preset_id)
+                .cloned()
+        }
+        .context("Macro preset was not found")?;
+        let _ = execute_macro_sequence(
+            preset.id,
+            &preset.steps,
+            press_locked_keys,
+            press_locked_mouse_count,
+            stop_immediately_on_retrigger,
+            target_window_title,
+            extra_target_window_titles,
+            match_duplicate_window_titles,
+        );
+        Ok(())
+    }
+
+    fn parse_locked_keys(spec: &str) -> Vec<String> {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let has_separator = trimmed
+            .chars()
+            .any(|ch| matches!(ch, ',' | ';' | '+' | ' ' | '\t' | '\n'));
+        if has_separator {
+            return trimmed
+                .split(|ch: char| matches!(ch, ',' | ';' | '+' | ' ' | '\t' | '\n'))
+                .filter_map(|part| {
+                    let key = part.trim();
+                    (!key.is_empty()).then(|| normalize_locked_key(key))
+                })
+                .collect();
+        }
+
+        if trimmed.len() > 1
+            && trimmed
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric())
+        {
+            return trimmed
+                .chars()
+                .map(|ch| normalize_locked_key(&ch.to_string()))
+                .collect();
+        }
+
+        vec![normalize_locked_key(trimmed)]
+    }
+
+    fn normalize_locked_key(key: &str) -> String {
+        let trimmed = key.trim();
+        if let Some(vk) = hotkey::key_name_to_vk(trimmed)
+            && let Some(name) = hotkey::vk_to_key_name(vk)
+        {
+            return name.to_owned();
+        }
+        trimmed.to_owned()
+    }
+
+    fn show_toolbox_preset(owner_preset_id: u32, step: &MacroStep) -> Result<()> {
+        let preset_id = step
+            .key
+            .trim()
+            .parse::<u32>()
+            .context("Toolbox preset id is invalid")?;
+        let preset = {
+            let hook_state = HOOK_STATE.lock();
+            hook_state
+                .toolbox_presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .cloned()
+        }
+        .context("Toolbox preset was not found")?;
+        let text = if step.text_override.trim().is_empty() {
+            preset.text.trim().to_owned()
+        } else {
+            step.text_override.trim().to_owned()
+        };
+        if text.is_empty() {
+            hide_toolbox_now();
+            return Ok(());
+        }
+
+        let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+        let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+        let scale_x = screen_width as f32 / 1920.0;
+        let scale_y = screen_height as f32 / 1080.0;
+        let expires_at = if step.timed_override && step.duration_override_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(step.duration_override_ms))
+        } else {
+            None
+        };
+
+        *TOOLBOX_DISPLAY.lock() = Some(ToolboxDisplayState {
+            owner_preset_id: Some(owner_preset_id),
+            preset_id: Some(preset.id),
+            text,
+            text_color: preset.text_color,
+            background_color: preset.background_color,
+            background_opacity: preset.background_opacity.clamp(0.0, 1.0),
+            rounded_background: preset.rounded_background,
+            font_size: preset.font_size.max(1.0),
+            x: (preset.x as f32 * scale_x).round() as i32,
+            y: (preset.y as f32 * scale_y).round() as i32,
+            width: ((preset.width.max(1)) as f32 * scale_x).round().max(1.0) as i32,
+            height: ((preset.height.max(1)) as f32 * scale_y).round().max(1.0) as i32,
+            auto_hide_on_owner_completion: expires_at.is_none(),
+            expires_at,
+        });
+        Ok(())
+    }
+
+    fn show_legacy_toolbox_text(owner_preset_id: u32, step: &MacroStep) {
+        let text = if step.text_override.trim().is_empty() {
+            step.key.trim().to_owned()
+        } else {
+            step.text_override.trim().to_owned()
+        };
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() {
+            hide_toolbox_now();
+            return;
+        }
+        *TOOLBOX_DISPLAY.lock() = Some(ToolboxDisplayState {
+            owner_preset_id: Some(owner_preset_id),
+            preset_id: None,
+            text: trimmed,
+            text_color: RgbaColor {
+                r: 244,
+                g: 244,
+                b: 244,
+                a: 255,
+            },
+            background_color: RgbaColor {
+                r: 34,
+                g: 34,
+                b: 34,
+                a: 255,
+            },
+            background_opacity: 0.72,
+            rounded_background: true,
+            font_size: 28.0,
+            x: 660,
+            y: 36,
+            width: 600,
+            height: 80,
+            auto_hide_on_owner_completion: true,
+            expires_at: if step.timed_override && step.duration_override_ms > 0 {
+                Some(Instant::now() + Duration::from_millis(step.duration_override_ms))
+            } else {
+                None
+            },
+        });
+    }
+
+    fn trigger_toolbox_display(owner_preset_id: u32, step: &MacroStep) {
+        if show_toolbox_preset(owner_preset_id, step).is_err() {
+            show_legacy_toolbox_text(owner_preset_id, step);
+        }
+    }
+
+    fn hide_toolbox_now() {
+        *TOOLBOX_DISPLAY.lock() = None;
+    }
+
+    fn hide_toolbox_for_owner(owner_preset_id: u32) {
+        let mut guard = TOOLBOX_DISPLAY.lock();
+        if let Some(active) = guard.as_ref()
+            && active.owner_preset_id == Some(owner_preset_id)
+            && active.auto_hide_on_owner_completion
+        {
+            *guard = None;
+        }
+    }
+
+    fn apply_lock_keys(keys: &[String], preset_id: Option<u32>) {
+        let keys_to_release = {
+            let mut to_release = Vec::new();
+            let mut hook_state = HOOK_STATE.lock();
+            for key in keys {
+                let already_locked = hook_state
+                    .locked_inputs
+                    .get(key)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                if !already_locked && hook_state.held_inputs.contains(key.as_str()) {
+                    to_release.push(key.clone());
+                }
+                *hook_state.locked_inputs.entry(key.clone()).or_insert(0) += 1;
+                if let Some(preset_id) = preset_id
+                    && let Some(active) = hook_state.active_hold_macros.get_mut(&preset_id)
+                    && !active
+                        .locked_keys
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(key))
+                {
+                    active.locked_keys.push(key.clone());
+                }
+            }
+            to_release
+        };
+
+        for key in keys_to_release {
+            let _ = send_key_event(&MacroStep {
+                key,
+                action: MacroAction::KeyUp,
+                delay_ms: 0,
+                x: 0,
+                y: 0,
+                ..MacroStep::default()
+            });
+        }
+    }
+
+    fn apply_unlock_keys(keys: &[String], preset_id: Option<u32>) {
+        let keys_to_restore = {
+            let mut to_restore = Vec::new();
+            let mut hook_state = HOOK_STATE.lock();
+            for key in keys {
+                let mut should_restore = false;
+                if let Some(preset_id) = preset_id
+                    && let Some(active) = hook_state.active_hold_macros.get_mut(&preset_id)
+                {
+                    active.locked_keys.retain(|locked| !locked.eq_ignore_ascii_case(key));
+                }
+                if let Some(count) = hook_state.locked_inputs.get_mut(key) {
+                    if *count > 1 {
+                        *count -= 1;
+                    } else {
+                        hook_state.locked_inputs.remove(key);
+                        should_restore = hook_state.held_inputs.contains(key.as_str());
+                    }
+                }
+                if should_restore {
+                    to_restore.push(key.clone());
+                }
+            }
+            to_restore
+        };
+
+        for key in keys_to_restore {
+            let _ = send_key_event(&MacroStep {
+                key,
+                action: MacroAction::KeyDown,
+                delay_ms: 0,
+                x: 0,
+                y: 0,
+                ..MacroStep::default()
+            });
+        }
+    }
+
+    fn apply_lock_mouse(preset_id: Option<u32>) {
+        let buttons_to_release = {
+            let mut hook_state = HOOK_STATE.lock();
+            let first_lock = hook_state.locked_mouse_count == 0;
+            hook_state.locked_mouse_count = hook_state.locked_mouse_count.saturating_add(1);
+            if let Some(preset_id) = preset_id
+                && let Some(active) = hook_state.active_hold_macros.get_mut(&preset_id)
+            {
+                active.locked_mouse_count = active.locked_mouse_count.saturating_add(1);
+            }
+            if first_lock {
+                hook_state.held_mouse_buttons.iter().cloned().collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+
+        for button in buttons_to_release {
+            let action = match button.as_str() {
+                "MouseLeft" => MacroAction::MouseLeftUp,
+                "MouseRight" => MacroAction::MouseRightUp,
+                "MouseMiddle" => MacroAction::MouseMiddleUp,
+                "MouseX1" => MacroAction::MouseX1Up,
+                "MouseX2" => MacroAction::MouseX2Up,
+                _ => continue,
+            };
+            let _ = send_mouse_event(&MacroStep {
+                action,
+                ..MacroStep::default()
+            });
+        }
+    }
+
+    fn apply_unlock_mouse(preset_id: Option<u32>) {
+        let should_restore = {
+            let mut hook_state = HOOK_STATE.lock();
+            if let Some(preset_id) = preset_id
+                && let Some(active) = hook_state.active_hold_macros.get_mut(&preset_id)
+                && active.locked_mouse_count > 0
+            {
+                active.locked_mouse_count -= 1;
+            }
+            if hook_state.locked_mouse_count > 0 {
+                hook_state.locked_mouse_count -= 1;
+            }
+            hook_state.locked_mouse_count == 0
+        };
+
+        if should_restore {
+            restore_physical_mouse_buttons();
+        }
+    }
+
+    fn restore_physical_mouse_buttons() {
+        for (vk, action) in [
+            (0x01, MacroAction::MouseLeftDown),
+            (0x02, MacroAction::MouseRightDown),
+            (0x04, MacroAction::MouseMiddleDown),
+            (0x05, MacroAction::MouseX1Down),
+            (0x06, MacroAction::MouseX2Down),
+        ] {
+            let is_down = unsafe { GetAsyncKeyState(vk) } < 0;
+            if is_down {
+                let _ = send_mouse_event(&MacroStep {
+                    action,
+                    ..MacroStep::default()
+                });
+            }
+        }
+    }
+
+    fn collect_macro_release_steps(steps: &[MacroStep]) -> Vec<MacroStep> {
+        let mut held_keys = HashSet::new();
+        let mut held_mouse = HashSet::new();
+
+        for step in steps {
+            match step.action {
+                MacroAction::KeyDown => {
+                    held_keys.insert(step.key.clone());
+                }
+                MacroAction::KeyUp | MacroAction::KeyPress => {
+                    held_keys.remove(&step.key);
+                }
+                MacroAction::TypeText
+                | MacroAction::ApplyWindowPreset
+                | MacroAction::FocusWindowPreset
+                | MacroAction::TriggerMacroPreset
+                | MacroAction::EnableCrosshairProfile
+                | MacroAction::DisableCrosshair
+                | MacroAction::EnablePinPreset
+                | MacroAction::DisablePin
+                | MacroAction::PlayMousePathPreset
+                | MacroAction::EnableZoomPreset
+                | MacroAction::DisableZoom
+                | MacroAction::PlaySoundPreset => {}
+                MacroAction::LoopStart
+                | MacroAction::LoopEnd
+                | MacroAction::StopIfTriggerPressedAgain
+                | MacroAction::StopIfKeyPressed
+                | MacroAction::ShowToolbox
+                | MacroAction::HideToolbox
+                | MacroAction::LockKeys
+                | MacroAction::UnlockKeys
+                | MacroAction::LockMouse
+                | MacroAction::UnlockMouse
+                | MacroAction::EnableMacroPreset
+                | MacroAction::DisableMacroPreset => {}
+                MacroAction::MouseLeftDown => {
+                    held_mouse.insert(MacroAction::MouseLeftUp);
+                }
+                MacroAction::MouseLeftUp | MacroAction::MouseLeftClick => {
+                    held_mouse.remove(&MacroAction::MouseLeftUp);
+                }
+                MacroAction::MouseRightDown => {
+                    held_mouse.insert(MacroAction::MouseRightUp);
+                }
+                MacroAction::MouseRightUp | MacroAction::MouseRightClick => {
+                    held_mouse.remove(&MacroAction::MouseRightUp);
+                }
+                MacroAction::MouseMiddleDown => {
+                    held_mouse.insert(MacroAction::MouseMiddleUp);
+                }
+                MacroAction::MouseMiddleUp | MacroAction::MouseMiddleClick => {
+                    held_mouse.remove(&MacroAction::MouseMiddleUp);
+                }
+                MacroAction::MouseX1Down => {
+                    held_mouse.insert(MacroAction::MouseX1Up);
+                }
+                MacroAction::MouseX1Up | MacroAction::MouseX1Click => {
+                    held_mouse.remove(&MacroAction::MouseX1Up);
+                }
+                MacroAction::MouseX2Down => {
+                    held_mouse.insert(MacroAction::MouseX2Up);
+                }
+                MacroAction::MouseX2Up | MacroAction::MouseX2Click => {
+                    held_mouse.remove(&MacroAction::MouseX2Up);
+                }
+                MacroAction::MouseWheelUp
+                | MacroAction::MouseWheelDown
+                | MacroAction::MouseMoveAbsolute
+                | MacroAction::MouseMoveRelative => {}
+            }
+        }
+
+        let mut cleanup_steps = Vec::new();
+        for key in held_keys {
+            cleanup_steps.push(MacroStep {
+                key,
+                action: MacroAction::KeyUp,
+                delay_ms: 0,
+                x: 0,
+                y: 0,
+                ..MacroStep::default()
+            });
+        }
+        for action in held_mouse {
+            cleanup_steps.push(MacroStep {
+                key: String::new(),
+                action,
+                delay_ms: 0,
+                x: 0,
+                y: 0,
+                ..MacroStep::default()
+            });
+        }
+        cleanup_steps
+    }
+
+    fn send_key_event(step: &MacroStep) -> Result<()> {
+        match step.action {
+            MacroAction::MouseLeftClick
+            | MacroAction::MouseLeftDown
+            | MacroAction::MouseLeftUp
+            | MacroAction::MouseRightClick
+            | MacroAction::MouseRightDown
+            | MacroAction::MouseRightUp
+            | MacroAction::MouseMiddleClick
+            | MacroAction::MouseMiddleDown
+            | MacroAction::MouseMiddleUp
+            | MacroAction::MouseX1Click
+            | MacroAction::MouseX1Down
+            | MacroAction::MouseX1Up
+            | MacroAction::MouseX2Click
+            | MacroAction::MouseX2Down
+            | MacroAction::MouseX2Up
+            | MacroAction::MouseWheelUp
+            | MacroAction::MouseWheelDown
+            | MacroAction::MouseMoveAbsolute
+            | MacroAction::MouseMoveRelative => return send_mouse_event(step),
+            MacroAction::TypeText => return send_text_input(&step.key),
+            MacroAction::ApplyWindowPreset
+            | MacroAction::FocusWindowPreset
+            | MacroAction::TriggerMacroPreset
+            | MacroAction::EnableCrosshairProfile
+            | MacroAction::DisableCrosshair
+            | MacroAction::EnablePinPreset
+            | MacroAction::DisablePin
+            | MacroAction::PlayMousePathPreset
+            | MacroAction::EnableZoomPreset
+            | MacroAction::DisableZoom
+            | MacroAction::PlaySoundPreset => return Ok(()),
+            MacroAction::LoopStart
+            | MacroAction::LoopEnd
+            | MacroAction::StopIfTriggerPressedAgain
+            | MacroAction::StopIfKeyPressed
+            | MacroAction::ShowToolbox
+            | MacroAction::HideToolbox
+            | MacroAction::LockKeys
+            | MacroAction::UnlockKeys
+            | MacroAction::LockMouse
+            | MacroAction::UnlockMouse
+            | MacroAction::EnableMacroPreset
+            | MacroAction::DisableMacroPreset => return Ok(()),
+            MacroAction::KeyPress | MacroAction::KeyDown | MacroAction::KeyUp => {}
+        }
+
+        let Some(vk) = hotkey::key_name_to_vk(&step.key) else {
+            bail!("Unsupported macro key: {}", step.key);
+        };
+        let base_flags = if is_extended_key(vk) {
+            KEYEVENTF_EXTENDEDKEY
+        } else {
+            Default::default()
+        };
+        let key_down = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk as u16),
+                    wScan: 0,
+                    dwFlags: base_flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let key_up = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk as u16),
+                    wScan: 0,
+                    dwFlags: base_flags | KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe {
+            let inputs: Vec<INPUT> = match step.action {
+                MacroAction::KeyPress => vec![key_down, key_up],
+                MacroAction::KeyDown => vec![key_down],
+                MacroAction::KeyUp => vec![key_up],
+                _ => unreachable!("mouse actions are handled earlier"),
+            };
+            let sent = SendInput(&inputs, size_of::<INPUT>() as i32);
+            if sent == 0 {
+                bail!("SendInput failed");
+            }
+        }
+        Ok(())
+    }
+
+    fn send_text_input(text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
+        for unit in text.encode_utf16() {
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: KEYEVENTF_UNICODE,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        unsafe {
+            let sent = SendInput(&inputs, size_of::<INPUT>() as i32);
+            if sent == 0 {
+                bail!("SendInput failed");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn send_mouse_event(step: &MacroStep) -> Result<()> {
+        match step.action {
+            MacroAction::MouseMoveAbsolute => {
+                send_mouse_move_absolute(step.x, step.y)?;
+                return Ok(());
+            }
+            MacroAction::MouseMoveRelative => {
+                send_mouse_move_relative(step.x, step.y)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let (flags, mouse_data, repeat_up) = match step.action {
+            MacroAction::MouseLeftClick => (MOUSEEVENTF_LEFTDOWN, 0, Some(MOUSEEVENTF_LEFTUP)),
+            MacroAction::MouseLeftDown => (MOUSEEVENTF_LEFTDOWN, 0, None),
+            MacroAction::MouseLeftUp => (MOUSEEVENTF_LEFTUP, 0, None),
+            MacroAction::MouseRightClick => (MOUSEEVENTF_RIGHTDOWN, 0, Some(MOUSEEVENTF_RIGHTUP)),
+            MacroAction::MouseRightDown => (MOUSEEVENTF_RIGHTDOWN, 0, None),
+            MacroAction::MouseRightUp => (MOUSEEVENTF_RIGHTUP, 0, None),
+            MacroAction::MouseMiddleClick => {
+                (MOUSEEVENTF_MIDDLEDOWN, 0, Some(MOUSEEVENTF_MIDDLEUP))
+            }
+            MacroAction::MouseMiddleDown => (MOUSEEVENTF_MIDDLEDOWN, 0, None),
+            MacroAction::MouseMiddleUp => (MOUSEEVENTF_MIDDLEUP, 0, None),
+            MacroAction::MouseX1Click => (MOUSEEVENTF_XDOWN, XBUTTON1_DATA as u32, Some(MOUSEEVENTF_XUP)),
+            MacroAction::MouseX1Down => (MOUSEEVENTF_XDOWN, XBUTTON1_DATA as u32, None),
+            MacroAction::MouseX1Up => (MOUSEEVENTF_XUP, XBUTTON1_DATA as u32, None),
+            MacroAction::MouseX2Click => (MOUSEEVENTF_XDOWN, XBUTTON2_DATA as u32, Some(MOUSEEVENTF_XUP)),
+            MacroAction::MouseX2Down => (MOUSEEVENTF_XDOWN, XBUTTON2_DATA as u32, None),
+            MacroAction::MouseX2Up => (MOUSEEVENTF_XUP, XBUTTON2_DATA as u32, None),
+            MacroAction::MouseWheelUp => (MOUSEEVENTF_WHEEL, 120u32, None),
+            MacroAction::MouseWheelDown => (MOUSEEVENTF_WHEEL, (-120i32) as u32, None),
+            _ => bail!("Unsupported mouse action"),
+        };
+
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: mouse_data,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+
+        unsafe {
+            let mut inputs = vec![input];
+            if let Some(up_flags) = repeat_up {
+                inputs.push(INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            mouseData: mouse_data,
+                            dwFlags: up_flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+            let sent = SendInput(&inputs, size_of::<INPUT>() as i32);
+            if sent == 0 {
+                bail!("SendInput failed");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn send_mouse_move_absolute(x: i32, y: i32) -> Result<()> {
+        let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+        let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+        let normalized_x = ((x.clamp(0, screen_w - 1) as i64) * 65535 / (screen_w - 1).max(1) as i64) as i32;
+        let normalized_y = ((y.clamp(0, screen_h - 1) as i64) * 65535 / (screen_h - 1).max(1) as i64) as i32;
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: normalized_x,
+                    dy: normalized_y,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe {
+            let sent = SendInput(&[input], size_of::<INPUT>() as i32);
+            if sent == 0 {
+                let _ = SetCursorPos(x, y);
+            }
+        }
+        Ok(())
+    }
+
+    fn send_mouse_move_relative(dx: i32, dy: i32) -> Result<()> {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe {
+            let sent = SendInput(&[input], size_of::<INPUT>() as i32);
+            if sent == 0 {
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let _ = SetCursorPos(point.x + dx, point.y + dy);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_extended_key(vk: u32) -> bool {
+        matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C)
+    }
+
+    fn internal_app_window_class(hwnd: HWND) -> Option<String> {
+        unsafe {
+            let mut buffer = [0u16; 256];
+            let copied = GetClassNameW(hwnd, &mut buffer);
+            if copied <= 0 {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&buffer[..copied as usize]))
+        }
+    }
+
+    fn is_internal_app_window(hwnd: HWND) -> bool {
+        internal_app_window_class(hwnd).is_some_and(|class_name| {
+            matches!(
+                class_name.as_str(),
+                "CrosshairController" | "CrosshairOverlay" | "CrosshairToolbox" | "Magnifier"
+            )
+        })
+    }
+
+    fn window_belongs_to_current_process(hwnd: HWND) -> bool {
+        unsafe {
+            let mut pid = 0u32;
+            let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            pid != 0 && pid == GetCurrentProcessId()
+        }
+    }
+
+    fn looks_like_main_ui_window(hwnd: HWND) -> bool {
+        unsafe {
+            if hwnd.0.is_null() || !window_belongs_to_current_process(hwnd) || is_internal_app_window(hwnd) {
+                return false;
+            }
+            if GetAncestor(hwnd, GA_ROOT) != hwnd {
+                return false;
+            }
+            if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null()) {
+                return false;
+            }
+            let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+            ) as u32;
+            (style & WS_OVERLAPPEDWINDOW.0) != 0 || (style & WS_CAPTION.0) != 0
+        }
+    }
+
+    #[derive(Default)]
+    struct AppUiWindowSearch {
+        visible: Option<HWND>,
+        hidden: Option<HWND>,
+    }
+
+    unsafe fn find_app_ui_window() -> Option<HWND> {
+        let mut found = AppUiWindowSearch::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(find_app_ui_window_proc),
+            LPARAM((&mut found) as *mut _ as isize),
+        );
+        found.visible.or(found.hidden)
+    }
+
+    unsafe extern "system" fn find_app_ui_window_proc(
+        hwnd: HWND,
+        lparam: LPARAM,
+    ) -> windows::core::BOOL {
+        let found = &mut *(lparam.0 as *mut AppUiWindowSearch);
+        if !looks_like_main_ui_window(hwnd) {
+            return true.into();
+        }
+        if windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() {
+            found.visible = Some(hwnd);
+            false.into()
+        } else {
+            if found.hidden.is_none() {
+                found.hidden = Some(hwnd);
+            }
+            true.into()
+        }
+    }
+
+    fn is_ui_in_foreground() -> bool {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() {
+                return false;
+            }
+            let root = GetAncestor(foreground, GA_ROOT);
+            if root.0.is_null() {
+                return false;
+            }
+            window_belongs_to_current_process(root) && !is_internal_app_window(root)
+        }
+    }
+
+    fn show_ui_window_native() {
+        unsafe {
+            let Some(app) = find_app_ui_window() else {
+                return;
+            };
+            if app.0.is_null() {
+                return;
+            }
+            let foreground = GetForegroundWindow();
+            let current_thread = GetCurrentThreadId();
+            let app_thread = GetWindowThreadProcessId(app, None);
+            let foreground_thread = if foreground.0.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, None)
+            };
+            let attach_foreground = foreground_thread != 0 && foreground_thread != current_thread;
+            let attach_app = app_thread != 0 && app_thread != current_thread;
+
+            if attach_foreground {
+                let _ = AttachThreadInput(foreground_thread, current_thread, true);
+            }
+            if attach_app {
+                let _ = AttachThreadInput(app_thread, current_thread, true);
+            }
+            let _ = ShowWindow(app, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+            let _ = ShowWindow(app, windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL);
+            let _ = ShowWindow(app, SW_RESTORE);
+            let mut rect = RECT::default();
+            if GetWindowRect(app, &mut rect).is_ok() {
+                let width = (rect.right - rect.left).max(0);
+                let height = (rect.bottom - rect.top).max(0);
+                if width < 32 || height < 32 {
+                    let desired_w = 980;
+                    let desired_h = 980;
+                    let screen_w = GetSystemMetrics(SM_CXSCREEN).max(1);
+                    let screen_h = GetSystemMetrics(SM_CYSCREEN).max(1);
+                    let pos_x = ((screen_w - desired_w) / 2).max(0);
+                    let pos_y = ((screen_h - desired_h) / 2).max(0);
+                    let _ = SetWindowPos(
+                        app,
+                        None,
+                        pos_x,
+                        pos_y,
+                        desired_w,
+                        desired_h,
+                        SWP_NOZORDER | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+            let _ = SetWindowPos(
+                app,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetWindowPos(
+                app,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = BringWindowToTop(app);
+            let _ = SetForegroundWindow(app);
+            let _ = SetActiveWindow(app);
+            let _ = SetFocus(Some(app));
+            if attach_app {
+                let _ = AttachThreadInput(app_thread, current_thread, false);
+            }
+            if attach_foreground {
+                let _ = AttachThreadInput(foreground_thread, current_thread, false);
+            }
+        }
+    }
+
+    fn hide_ui_window_native() {
+        unsafe {
+            let Some(app) = find_app_ui_window() else {
+                return;
+            };
+            if app.0.is_null() {
+                return;
+            }
+            let _ = ShowWindow(app, SW_HIDE);
+        }
+    }
+
+    fn apply_window_preset(preset: &WindowPreset) -> Result<()> {
+        if !preset.enabled {
+            return Ok(());
+        }
+        unsafe {
+            let target = resolve_window_target(
+                preset.target_window_title.as_deref(),
+                &preset.extra_target_window_titles,
+                false,
+                false,
+            );
+            if target.0.is_null() {
+                bail!("No foreground window is available");
+            }
+            let target_root = GetAncestor(target, GA_ROOT);
+            if !target_root.0.is_null() && window_belongs_to_current_process(target_root) && !is_internal_app_window(target_root) {
+                return Ok(());
+            }
+
+            let _ = ShowWindow(target, SW_RESTORE);
+            if preset.remove_title_bar {
+                let _ = remove_window_title_bar(target);
+            } else {
+                let _ = restore_window_title_bar(target);
+            }
+            let bounds = calculate_window_bounds(target, preset)?;
+            let _ = SetWindowPos(
+                target,
+                None,
+                bounds.left,
+                bounds.top,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED
+                    | SWP_NOACTIVATE
+                    | SWP_NOZORDER,
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_window_preset_animated(preset: &WindowPreset) -> Result<()> {
+        if !preset.enabled || !preset.animate_enabled {
+            return Ok(());
+        }
+        unsafe {
+            let target = resolve_window_target(
+                preset.target_window_title.as_deref(),
+                &preset.extra_target_window_titles,
+                false,
+                false,
+            );
+            if target.0.is_null() {
+                bail!("No foreground window is available");
+            }
+            let target_root = GetAncestor(target, GA_ROOT);
+            if !target_root.0.is_null() && window_belongs_to_current_process(target_root) && !is_internal_app_window(target_root) {
+                return Ok(());
+            }
+
+            ensure_window_restored(target);
+            if preset.remove_title_bar {
+                let _ = remove_window_title_bar(target);
+            } else {
+                let _ = restore_window_title_bar(target);
+            }
+            wait_for_window_frame_to_settle(target);
+
+            let mut start = RECT::default();
+            GetWindowRect(target, &mut start)?;
+            let end = calculate_window_bounds(target, preset)?;
+            animate_window_rect(target, start, end, preset.animate_duration_ms.max(60))?;
+        }
+        Ok(())
+    }
+
+    fn restore_window_title_bar_for_preset(preset: &WindowPreset) -> Result<()> {
+        if !preset.restore_titlebar_enabled {
+            return Ok(());
+        }
+        unsafe {
+            let target = resolve_window_target(
+                preset.target_window_title.as_deref(),
+                &preset.extra_target_window_titles,
+                false,
+                false,
+            );
+            if target.0.is_null() {
+                bail!("No foreground window is available");
+            }
+            let target_root = GetAncestor(target, GA_ROOT);
+            if !target_root.0.is_null() && window_belongs_to_current_process(target_root) && !is_internal_app_window(target_root) {
+                return Ok(());
+            }
+
+            let _ = ShowWindow(target, SW_RESTORE);
+            restore_window_title_bar(target)?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn expand_window_edge(direction: WindowExpandDirection, amount_px: i32) -> Result<()> {
+        unsafe {
+            let target = resolve_window_target(None, &[], false, false);
+            if target.0.is_null() {
+                bail!("No foreground window is available");
+            }
+            let target_root = GetAncestor(target, GA_ROOT);
+            if !target_root.0.is_null() && window_belongs_to_current_process(target_root) && !is_internal_app_window(target_root) {
+                return Ok(());
+            }
+
+            ensure_window_restored(target);
+            let mut rect = RECT::default();
+            GetWindowRect(target, &mut rect)?;
+            match direction {
+                WindowExpandDirection::Up => rect.top -= amount_px,
+                WindowExpandDirection::Down => rect.bottom += amount_px,
+                WindowExpandDirection::Left => rect.left -= amount_px,
+                WindowExpandDirection::Right => rect.right += amount_px,
+            }
+            let _ = SetWindowPos(
+                target,
+                None,
+                rect.left,
+                rect.top,
+                (rect.right - rect.left).max(1),
+                (rect.bottom - rect.top).max(1),
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+        Ok(())
+    }
+
+    fn animate_window_rect(target: HWND, start: RECT, end: RECT, duration_ms: u64) -> Result<()> {
+        let start_width = (start.right - start.left).max(1);
+        let start_height = (start.bottom - start.top).max(1);
+        let end_width = (end.right - end.left).max(1);
+        let end_height = (end.bottom - end.top).max(1);
+        let resizing = start_width != end_width || start_height != end_height;
+        let duration = Duration::from_millis(duration_ms.max(if resizing { 160 } else { 120 }));
+        let frame_sleep = if resizing {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(8)
+        };
+        let start_time = Instant::now();
+        let mut last_rect = start;
+
+        loop {
+            let elapsed = start_time.elapsed();
+            let t = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+            let eased = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+            let left = lerp_i32(start.left, end.left, eased);
+            let top = lerp_i32(start.top, end.top, eased);
+            let right = lerp_i32(start.right, end.right, eased);
+            let bottom = lerp_i32(start.bottom, end.bottom, eased);
+            let next_rect = RECT {
+                left,
+                top,
+                right,
+                bottom,
+            };
+            if next_rect.left == last_rect.left
+                && next_rect.top == last_rect.top
+                && next_rect.right == last_rect.right
+                && next_rect.bottom == last_rect.bottom
+                && t < 1.0
+            {
+                thread::sleep(frame_sleep);
+                continue;
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    target,
+                    None,
+                    left,
+                    top,
+                    (right - left).max(1),
+                    (bottom - top).max(1),
+                    SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+            last_rect = next_rect;
+
+            if t >= 1.0 {
+                break;
+            }
+            thread::sleep(frame_sleep);
+        }
+        Ok(())
+    }
+
+    fn lerp_i32(start: i32, end: i32, t: f32) -> i32 {
+        start + ((end - start) as f32 * t).round() as i32
+    }
+
+    fn remove_window_title_bar(target: HWND) -> Result<()> {
+        unsafe {
+            let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+                target,
+                windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+            ) as u32;
+            let caption = windows::Win32::UI::WindowsAndMessaging::WS_CAPTION.0;
+            let thickframe = windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME.0;
+            let new_style = style & !caption & !thickframe;
+            if new_style != style {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongW(
+                    target,
+                    windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                    new_style as i32,
+                );
+                let _ = SetWindowPos(
+                    target,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED
+                        | SWP_NOACTIVATE
+                        | SWP_NOZORDER
+                        | SWP_NOMOVE
+                        | SWP_NOSIZE,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_window_title_bar(target: HWND) -> Result<()> {
+        unsafe {
+            let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+                target,
+                windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+            ) as u32;
+            let new_style = style | WS_OVERLAPPEDWINDOW.0;
+            if new_style != style {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongW(
+                    target,
+                    windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                    new_style as i32,
+                );
+            }
+
+            let mut rect = RECT::default();
+            GetWindowRect(target, &mut rect)?;
+            let _ = SetWindowPos(
+                target,
+                None,
+                rect.left,
+                rect.top,
+                (rect.right - rect.left).max(1),
+                (rect.bottom - rect.top).max(1),
+                windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED
+                    | SWP_NOACTIVATE
+                    | SWP_NOZORDER,
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_window_restored(target: HWND) {
+        unsafe {
+            if IsZoomed(target).as_bool() {
+                let _ = ShowWindow(target, SW_RESTORE);
+                for _ in 0..18 {
+                    if !IsZoomed(target).as_bool() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                let _ = ShowWindow(target, SW_RESTORE);
+            }
+        }
+    }
+
+    fn wait_for_window_frame_to_settle(target: HWND) {
+        unsafe {
+            let mut previous = RECT::default();
+            let _ = GetWindowRect(target, &mut previous);
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(12));
+                let mut current = RECT::default();
+                if GetWindowRect(target, &mut current).is_ok()
+                    && current.left == previous.left
+                    && current.top == previous.top
+                    && current.right == previous.right
+                    && current.bottom == previous.bottom
+                {
+                    break;
+                }
+                previous = current;
+            }
+        }
+    }
+
+    fn calculate_window_bounds(hwnd: HWND, preset: &WindowPreset) -> Result<RECT> {
+        unsafe {
+            let mut window_rect = RECT::default();
+            GetWindowRect(hwnd, &mut window_rect)?;
+            let mut client_rect = RECT::default();
+            GetClientRect(hwnd, &mut client_rect)?;
+            let frame_extra_width =
+                (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
+            let frame_extra_height =
+                (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+
+            let mut frame_rect = RECT::default();
+            let frame_result = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut frame_rect as *mut _ as *mut c_void,
+                size_of::<RECT>() as u32,
+            );
+
+            let (left_invisible, top_invisible) =
+                if frame_result.is_ok() {
+                    (
+                        frame_rect.left - window_rect.left,
+                        frame_rect.top - window_rect.top,
+                    )
+                } else {
+                    (0, 0)
+                };
+            let (right_invisible, bottom_invisible) = if frame_result.is_ok() {
+                (
+                    window_rect.right - frame_rect.right,
+                    window_rect.bottom - frame_rect.bottom,
+                )
+            } else {
+                (0, 0)
+            };
+
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut monitor_info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let monitor_rect = if GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+                monitor_info.rcMonitor
+            } else {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: GetSystemMetrics(SM_CXSCREEN),
+                    bottom: GetSystemMetrics(SM_CYSCREEN),
+                }
+            };
+            let screen_width = monitor_rect.right - monitor_rect.left;
+            let screen_height = monitor_rect.bottom - monitor_rect.top;
+            let client_width = preset.width.max(1);
+            let client_height = preset.height.max(1);
+            let outer_width = client_width + frame_extra_width;
+            let outer_height = client_height + frame_extra_height;
+            let visible_width = (outer_width - left_invisible - right_invisible).max(1);
+            let visible_height = (outer_height - top_invisible - bottom_invisible).max(1);
+            let (target_x, target_y) = match preset.anchor {
+                WindowAnchor::Manual => (preset.x, preset.y),
+                WindowAnchor::Center => (
+                    monitor_rect.left + ((screen_width - visible_width) / 2),
+                    monitor_rect.top + ((screen_height - visible_height) / 2),
+                ),
+                WindowAnchor::TopLeft => (monitor_rect.left, monitor_rect.top),
+                WindowAnchor::Top => (
+                    monitor_rect.left + ((screen_width - visible_width) / 2),
+                    monitor_rect.top,
+                ),
+                WindowAnchor::TopRight => (
+                    monitor_rect.left + (screen_width - visible_width),
+                    monitor_rect.top,
+                ),
+                WindowAnchor::Left => (
+                    monitor_rect.left,
+                    monitor_rect.top + ((screen_height - visible_height) / 2),
+                ),
+                WindowAnchor::Right => (
+                    monitor_rect.left + (screen_width - visible_width),
+                    monitor_rect.top + ((screen_height - visible_height) / 2),
+                ),
+                WindowAnchor::BottomLeft => (
+                    monitor_rect.left,
+                    monitor_rect.top + (screen_height - visible_height),
+                ),
+                WindowAnchor::Bottom => (
+                    monitor_rect.left + ((screen_width - visible_width) / 2),
+                    monitor_rect.top + (screen_height - visible_height),
+                ),
+                WindowAnchor::BottomRight => (
+                    monitor_rect.left + (screen_width - visible_width),
+                    monitor_rect.top + (screen_height - visible_height),
+                ),
+            };
+
+            let left = target_x - left_invisible;
+            let top = target_y - top_invisible;
+            Ok(RECT {
+                left,
+                top,
+                right: left + client_width + frame_extra_width,
+                bottom: top + client_height + frame_extra_height,
+            })
+        }
+    }
+
+    fn macro_target_matches(group: &MacroGroup) -> bool {
+        if group.target_window_title.is_none() && group.extra_target_window_titles.is_empty() {
+            return true;
+        }
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() {
+                return false;
+            }
+            window_matches_any_selector(
+                foreground,
+                group.target_window_title.as_deref(),
+                &group.extra_target_window_titles,
+                group.match_duplicate_window_titles,
+            )
+        }
+    }
+
+    fn window_focus_matches(
+        target_title: Option<&str>,
+        extra_target_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> bool {
+        if target_title.is_none() && extra_target_titles.is_empty() {
+            return true;
+        }
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() {
+                return false;
+            }
+            window_matches_any_selector(
+                foreground,
+                target_title,
+                extra_target_titles,
+                match_duplicate_window_titles,
+            )
+        }
+    }
+
+    fn resolve_window_target(
+        target_title: Option<&str>,
+        extra_target_titles: &[String],
+        match_duplicate_window_titles: bool,
+        prefer_other_if_foreground_matches: bool,
+    ) -> HWND {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if !foreground.0.is_null()
+                && window_matches_any_selector(
+                    foreground,
+                    target_title,
+                    extra_target_titles,
+                    match_duplicate_window_titles,
+                )
+            {
+                if prefer_other_if_foreground_matches {
+                    if let Some(target) = target_title
+                        && let Some(hwnd) = find_window_by_selector_excluding(
+                            target,
+                            match_duplicate_window_titles,
+                            Some(foreground),
+                        )
+                    {
+                        return hwnd;
+                    }
+                    for title in extra_target_titles {
+                        if let Some(hwnd) = find_window_by_selector_excluding(
+                            title,
+                            match_duplicate_window_titles,
+                            Some(foreground),
+                        ) {
+                            return hwnd;
+                        }
+                    }
+                }
+                return foreground;
+            }
+            if let Some(title) = target_title
+                && let Some(hwnd) =
+                    find_window_by_selector_excluding(title, match_duplicate_window_titles, None)
+            {
+                return hwnd;
+            }
+            for title in extra_target_titles {
+                if let Some(hwnd) =
+                    find_window_by_selector_excluding(title, match_duplicate_window_titles, None)
+                {
+                    return hwnd;
+                }
+            }
+            foreground
+        }
+    }
+
+    fn find_target_window_hwnd(
+        target_title: Option<&str>,
+        extra_target_titles: &[String],
+        match_duplicate_window_titles: bool,
+        prefer_other_if_foreground_matches: bool,
+    ) -> Option<HWND> {
+        let hwnd = resolve_window_target(
+            target_title,
+            extra_target_titles,
+            match_duplicate_window_titles,
+            prefer_other_if_foreground_matches,
+        );
+        if hwnd.0.is_null() {
+            None
+        } else {
+            Some(hwnd)
+        }
+    }
+
+    fn shutdown_application(hwnd: HWND, runtime: &Runtime) -> Result<()> {
+        let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &notify_icon(hwnd)) };
+        let _ = unsafe { ShowWindow(runtime.overlay_hwnd, SW_HIDE) };
+        let _ = unsafe { ShowWindow(runtime.toolbox_hwnd, SW_HIDE) };
+        let _ = unsafe { ShowWindow(runtime.pin_hwnd, SW_HIDE) };
+        if let Some(active) = &runtime.active_pin_thumbnail {
+            let _ = unsafe { DwmUnregisterThumbnail(active.thumbnail_id) };
+        }
+        let _ = unsafe { UnhookWindowsHookEx(runtime.keyboard_hook) };
+        let _ = unsafe { UnhookWindowsHookEx(runtime.mouse_hook) };
+        {
+            let mut hook_state = HOOK_STATE.lock();
+            hook_state.window_presets.clear();
+            hook_state.window_expand_controls = WindowExpandControls::default();
+            hook_state.pin_presets.clear();
+            hook_state.active_pin_preset_id = None;
+            hook_state.macro_groups.clear();
+            hook_state.locked_inputs.clear();
+            hook_state.locked_mouse_count = 0;
+            hook_state.active_hold_macros.clear();
+            hook_state.held_mouse_buttons.clear();
+        }
+        let _ = audio::play_clip_blocking(&runtime.audio_settings.exit);
+        std::process::exit(0);
+    }
+
+    unsafe fn find_window_by_title(title: &str) -> Option<HWND> {
+        let mut found = None;
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(find_window_by_selector_proc),
+            LPARAM((&mut (title, &mut found)) as *mut _ as isize),
+        );
+        found
+    }
+
+    unsafe fn find_window_by_selector_excluding(
+        title: &str,
+        match_duplicate_window_titles: bool,
+        exclude: Option<HWND>,
+    ) -> Option<HWND> {
+        let mut found = None;
+        let mut payload = (title, match_duplicate_window_titles, exclude, &mut found);
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(find_window_by_selector_excluding_proc),
+            LPARAM((&mut payload) as *mut _ as isize),
+        );
+        found
+    }
+
+    unsafe extern "system" fn find_window_by_selector_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let (target, found) = &mut *(lparam.0 as *mut (&str, &mut Option<HWND>));
+        if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        if window_matches_selector(hwnd, target) {
+            **found = Some(hwnd);
+            return false.into();
+        }
+        true.into()
+    }
+
+    unsafe extern "system" fn find_window_by_selector_excluding_proc(
+        hwnd: HWND,
+        lparam: LPARAM,
+    ) -> windows::core::BOOL {
+        let (target, match_duplicate_window_titles, exclude, found) =
+            &mut *(lparam.0 as *mut (&str, bool, Option<HWND>, &mut Option<HWND>));
+        if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        if exclude.is_some_and(|excluded| excluded == hwnd) {
+            return true.into();
+        }
+        if window_matches_selector_with_duplicate_titles(
+            hwnd,
+            target,
+            *match_duplicate_window_titles,
+        ) {
+            **found = Some(hwnd);
+            return false.into();
+        }
+        true.into()
+    }
+
+    fn selector_base_title(target: &str) -> &str {
+        if let Some(prefix) = target.strip_suffix(')')
+            && let Some((base, _)) = prefix.rsplit_once(" (0x")
+        {
+            return base;
+        }
+        target
+    }
+
+    unsafe fn window_matches_selector(hwnd: HWND, target: &str) -> bool {
+        let Some(title) = window_title(hwnd) else {
+            return false;
+        };
+        title == target || format!("{title} (0x{:X})", hwnd.0 as usize) == target
+    }
+
+    unsafe fn window_matches_selector_with_duplicate_titles(
+        hwnd: HWND,
+        target: &str,
+        match_duplicate_window_titles: bool,
+    ) -> bool {
+        if window_matches_selector(hwnd, target) {
+            return true;
+        }
+        if !match_duplicate_window_titles {
+            return false;
+        }
+        let Some(title) = window_title(hwnd) else {
+            return false;
+        };
+        title == selector_base_title(target)
+    }
+
+    unsafe fn window_matches_any_selector(
+        hwnd: HWND,
+        target_title: Option<&str>,
+        extra_target_titles: &[String],
+        match_duplicate_window_titles: bool,
+    ) -> bool {
+        if let Some(target) = target_title
+            && window_matches_selector_with_duplicate_titles(
+                hwnd,
+                target,
+                match_duplicate_window_titles,
+            )
+        {
+            return true;
+        }
+        extra_target_titles
+            .iter()
+            .any(|target| {
+                window_matches_selector_with_duplicate_titles(
+                    hwnd,
+                    target,
+                    match_duplicate_window_titles,
+                )
+            })
+    }
+
+    unsafe fn window_title(hwnd: HWND) -> Option<String> {
+        let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer);
+        if copied <= 0 {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&buffer[..copied as usize]))
+        }
+    }
+
+    unsafe fn paint_overlay(
+        hwnd: HWND,
+        style: &CrosshairStyle,
+        rendered: RenderedCrosshair,
+    ) -> Result<()> {
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+        let window_x = (screen_width / 2) + style.x_offset - rendered.center_x;
+        let window_y = (screen_height / 2) + style.y_offset - rendered.center_y;
+
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            window_x,
+            window_y,
+            rendered.width as i32,
+            rendered.height as i32,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+
+        let screen_dc = GetDC(None);
+        if screen_dc.0.is_null() {
+            bail!("Failed to acquire the screen DC");
+        }
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.0.is_null() {
+            let _ = ReleaseDC(None, screen_dc);
+            bail!("Failed to create a memory DC");
+        }
+
+        let mut bitmap_info = BITMAPINFO::default();
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: rendered.width as i32,
+            biHeight: -(rendered.height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            Some(mem_dc),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )?;
+        if bitmap.0.is_null() {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            bail!("Failed to create the DIB surface");
+        }
+
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+        let bgra = rgba_to_bgra(&rendered.rgba);
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+
+        let destination = POINT { x: window_x, y: window_y };
+        let source = POINT { x: 0, y: 0 };
+        let size = SIZE {
+            cx: rendered.width as i32,
+            cy: rendered.height as i32,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            Some(screen_dc),
+            Some(&destination),
+            Some(&size),
+            Some(mem_dc),
+            Some(&source),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        let _ = SelectObject(mem_dc, old_bitmap);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        Ok(())
+    }
+
+    unsafe fn paint_mouse_trail(hwnd: HWND, points: &[POINT]) -> Result<()> {
+        let screen_width = GetSystemMetrics(SM_CXSCREEN).max(1);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN).max(1);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            screen_width,
+            screen_height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+
+        let screen_dc = GetDC(None);
+        if screen_dc.0.is_null() {
+            bail!("Failed to acquire the screen DC");
+        }
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.0.is_null() {
+            let _ = ReleaseDC(None, screen_dc);
+            bail!("Failed to create a memory DC");
+        }
+
+        let mut bitmap_info = BITMAPINFO::default();
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: screen_width,
+            biHeight: -screen_height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            Some(mem_dc),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )?;
+        if bitmap.0.is_null() {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            bail!("Failed to create mouse trail DIB");
+        }
+
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+        let pixel_len = (screen_width as usize) * (screen_height as usize) * 4;
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, pixel_len);
+        pixels.fill(0);
+        for segment in points.windows(2) {
+            if let [from, to] = segment {
+                draw_line_rgba(
+                    pixels,
+                    screen_width as usize,
+                    screen_height as usize,
+                    from.x,
+                    from.y,
+                    to.x,
+                    to.y,
+                    [255, 40, 40, 180],
+                );
+            }
+        }
+
+        let destination = POINT { x: 0, y: 0 };
+        let source = POINT { x: 0, y: 0 };
+        let size = SIZE {
+            cx: screen_width,
+            cy: screen_height,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            Some(screen_dc),
+            Some(&destination),
+            Some(&size),
+            Some(mem_dc),
+            Some(&source),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        let _ = SelectObject(mem_dc, old_bitmap);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        Ok(())
+    }
+
+    fn blend_rgba_pixel(
+        pixels: &mut [u8],
+        width: usize,
+        height: usize,
+        x: i32,
+        y: i32,
+        color: [u8; 4],
+    ) {
+        if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+            return;
+        }
+        let index = (y as usize * width + x as usize) * 4;
+        let alpha = color[3] as f32 / 255.0;
+        let inv = 1.0 - alpha;
+        let dst = &mut pixels[index..index + 4];
+        dst[0] = (dst[0] as f32 * inv + color[2] as f32 * alpha).round() as u8;
+        dst[1] = (dst[1] as f32 * inv + color[1] as f32 * alpha).round() as u8;
+        dst[2] = (dst[2] as f32 * inv + color[0] as f32 * alpha).round() as u8;
+        dst[3] = dst[3].max(color[3]);
+    }
+
+    fn draw_line_rgba(
+        pixels: &mut [u8],
+        width: usize,
+        height: usize,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: [u8; 4],
+    ) {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let steps = dx.abs().max(dy.abs()).max(1);
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let x = x0 as f32 + dx as f32 * t;
+            let y = y0 as f32 + dy as f32 * t;
+            for ox in -1..=1 {
+                for oy in -1..=1 {
+                    blend_rgba_pixel(
+                        pixels,
+                        width,
+                        height,
+                        x.round() as i32 + ox,
+                        y.round() as i32 + oy,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+
+    fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+        let mut bgra = rgba.to_vec();
+        for pixel in bgra.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        bgra
+    }
+
+    unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
+        let mut data = notify_icon(hwnd);
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        data.uCallbackMessage = WMAPP_TRAYICON;
+        let icon_path = runtime_icon_path(hwnd)?;
+        data.hIcon = windows::Win32::UI::WindowsAndMessaging::HICON(
+            LoadImageW(
+                None,
+                PCWSTR(icon_path.as_ptr()),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_LOADFROMFILE,
+            )?
+            .0,
+        );
+        let tip = "MacroNest".encode_utf16().collect::<Vec<_>>();
+        for (index, value) in tip.into_iter().enumerate() {
+            if index >= data.szTip.len().saturating_sub(1) {
+                break;
+            }
+            data.szTip[index] = value;
+        }
+        let _ = Shell_NotifyIconW(NIM_ADD, &data);
+        Ok(())
+    }
+
+    fn notify_icon(hwnd: HWND) -> NOTIFYICONDATAW {
+        NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_UID,
+            ..Default::default()
+        }
+    }
+
+    fn widestring(value: &str) -> Vec<u16> {
+        let mut wide: Vec<u16> = value.encode_utf16().collect();
+        wide.push(0);
+        wide
+    }
+
+    unsafe fn runtime_icon_path(hwnd: HWND) -> Result<Vec<u16>> {
+        let runtime = runtime_mut(hwnd).context("Runtime was not available for tray icon")?;
+        Ok(widestring(&runtime.paths.icon_file.to_string_lossy()))
+    }
+}
+
+#[cfg(windows)]
+pub use windows_overlay::*;
+
+#[cfg(not(windows))]
+mod fallback {
+    use anyhow::{Result, bail};
+
+    use crate::{
+        model::{
+            AudioSettings, CrosshairStyle, MacroGroup, ProfileRecord, WindowExpandControls,
+            WindowFocusPreset, WindowPreset, ZoomPreset,
+        },
+        storage::AppPaths,
+    };
+
+    #[derive(Debug, Clone)]
+    pub enum OverlayCommand {
+        Update(CrosshairStyle),
+        UpdateProfiles(Vec<ProfileRecord>),
+        UpdateWindowPresets(Vec<WindowPreset>),
+        UpdateWindowFocusPresets(Vec<WindowFocusPreset>),
+        UpdateWindowExpandControls(WindowExpandControls),
+        UpdateZoomPresets(Vec<ZoomPreset>),
+        UpdateMacroPresets(Vec<MacroGroup>),
+        UpdateAudioSettings(AudioSettings),
+        SetMacrosMasterEnabled(bool),
+        SetUiVisible(bool),
+        Exit,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum UiCommand {
+        ShowWindow,
+        Exit,
+    }
+
+    pub struct OverlayHandle;
+
+    impl OverlayHandle {
+        pub fn send(&self, _command: OverlayCommand) {}
+    }
+
+    pub fn start(
+        _paths: AppPaths,
+        _initial_style: CrosshairStyle,
+        _ui_tx: crossbeam_channel::Sender<UiCommand>,
+    ) -> Result<OverlayHandle> {
+        bail!("This application currently supports Windows only")
+    }
+}
+
+#[cfg(not(windows))]
+pub use fallback::*;
