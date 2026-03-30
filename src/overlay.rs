@@ -8,7 +8,7 @@ mod windows_overlay {
         mem::size_of,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicIsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -55,10 +55,6 @@ mod windows_overlay {
                     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, RegisterHotKey, SendInput,
                     SetActiveWindow, SetFocus, UnregisterHotKey, VIRTUAL_KEY,
                 },
-                Magnification::{
-                    MAGTRANSFORM, MS_SHOWMAGNIFIEDCURSOR, MagInitialize, MagSetWindowSource,
-                    MagSetWindowTransform, MagUninitialize, WC_MAGNIFIER,
-                },
                 Shell::{
                     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
                     Shell_NotifyIconW,
@@ -73,7 +69,7 @@ mod windows_overlay {
                     HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
                     IMAGE_ICON, KBDLLHOOKSTRUCT, KillTimer, LR_LOADFROMFILE, LoadCursorW, LoadImageW,
                     MSLLHOOKSTRUCT, IsIconic, IsZoomed,
-                    MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SM_CXSCREEN,
+                    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN,
                     SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
                     SWP_NOSIZE, SWP_NOZORDER,
                     SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
@@ -86,7 +82,7 @@ mod windows_overlay {
                     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WM_NCHITTEST, HTTRANSPARENT,
                     WM_MOUSEACTIVATE, MA_NOACTIVATE,
                     WM_MOUSEMOVE, WM_MOUSEWHEEL,
-                    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                    WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
                     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW,
                     WS_POPUP, GWLP_USERDATA, HC_ACTION, GW_OWNER,
                 },
@@ -103,8 +99,9 @@ mod windows_overlay {
             MacroStep, MacroTriggerMode, MousePathEvent, MousePathEventKind, MousePathPreset,
             PinPreset, ProfileRecord, RgbaColor, SoundLibraryItem, SoundPreset, ToolboxPreset,
             WindowAnchor, WindowExpandControls, WindowExpandDirection, WindowFocusPreset,
-            WindowPreset, ZoomPreset,
+            WindowPreset,
         },
+        platform,
         render::{RenderedCrosshair, render_crosshair},
         storage::AppPaths,
     };
@@ -115,6 +112,7 @@ mod windows_overlay {
     const XBUTTON1_DATA: u16 = 0x0001;
     const XBUTTON2_DATA: u16 = 0x0002;
     const WMAPP_TRAYICON: u32 = WM_APP + 1;
+    const WMAPP_PROCESS_QUEUE: u32 = WM_APP + 2;
     const MACRO_PRESET_BASE_ID: i32 = 10000;
 
     const MENU_TOGGLE: usize = 2001;
@@ -132,7 +130,7 @@ mod windows_overlay {
     static HOOK_STATE: Lazy<Mutex<HookState>> = Lazy::new(|| Mutex::new(HookState::default()));
     static OVERLAY_COMMAND_TX: Lazy<Mutex<Option<Sender<OverlayCommand>>>> =
         Lazy::new(|| Mutex::new(None));
-
+    static CONTROLLER_HWND: AtomicIsize = AtomicIsize::new(0);
     #[derive(Debug, Clone)]
     pub enum OverlayCommand {
         Update(CrosshairStyle),
@@ -143,7 +141,6 @@ mod windows_overlay {
         UpdateWindowExpandControls(WindowExpandControls),
         UpdatePinPresets(Vec<PinPreset>),
         UpdateMousePathPresets(Vec<MousePathPreset>),
-        UpdateZoomPresets(Vec<ZoomPreset>),
         UpdateToolboxPresets(Vec<ToolboxPreset>),
         UpdateMacroPresets(Vec<MacroGroup>),
         UpdateAudioSettings(AudioSettings),
@@ -171,6 +168,15 @@ mod windows_overlay {
         }
     }
 
+    pub fn wake_command_queue() {
+        unsafe {
+            let hwnd = HWND(CONTROLLER_HWND.load(Ordering::Relaxed) as *mut c_void);
+            if !hwnd.0.is_null() {
+                let _ = PostMessageW(Some(hwnd), WMAPP_PROCESS_QUEUE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     struct HookState {
         ui_tx: Option<Sender<UiCommand>>,
         window_presets: Vec<WindowPreset>,
@@ -179,9 +185,7 @@ mod windows_overlay {
         pin_presets: Vec<PinPreset>,
         mouse_path_presets: Vec<MousePathPreset>,
         active_pin_preset_id: Option<u32>,
-        zoom_presets: Vec<ZoomPreset>,
         toolbox_presets: Vec<ToolboxPreset>,
-        active_zoom_preset_id: Option<u32>,
         macro_groups: Vec<MacroGroup>,
         macros_master_enabled: bool,
         locked_inputs: HashMap<String, usize>,
@@ -213,9 +217,7 @@ mod windows_overlay {
                 pin_presets: Vec::new(),
                 mouse_path_presets: Vec::new(),
                 active_pin_preset_id: None,
-                zoom_presets: Vec::new(),
                 toolbox_presets: Vec::new(),
-                active_zoom_preset_id: None,
                 macro_groups: Vec::new(),
                 macros_master_enabled: true,
                 locked_inputs: HashMap::new(),
@@ -256,15 +258,16 @@ mod windows_overlay {
         mouse_trail_hwnd: HWND,
         toolbox_hwnd: HWND,
         pin_hwnd: HWND,
-        zoom_host_hwnd: HWND,
-        zoom_mag_hwnd: HWND,
-        last_zoom_update: Instant,
+        last_pin_update: Instant,
         toolbox_display: Option<ToolboxDisplayState>,
         tray_menu: HMENU,
         keyboard_hook: HHOOK,
         mouse_hook: HHOOK,
         running: Arc<AtomicBool>,
         active_pin_thumbnail: Option<ActivePinThumbnail>,
+        timer_interval_ms: u32,
+        ui_visible: bool,
+        ui_foreground: bool,
     }
 
     struct MouseRecordingSession {
@@ -330,6 +333,8 @@ mod windows_overlay {
         preset_id: u32,
         source_hwnd: HWND,
         thumbnail_id: isize,
+        last_target_bounds: (i32, i32, i32, i32),
+        last_source_crop: Option<(i32, i32, i32, i32)>,
     }
 
     #[allow(dead_code)]
@@ -373,8 +378,6 @@ mod windows_overlay {
             register_class(instance, w!("CrosshairController"), Some(controller_wnd_proc))?;
             register_class(instance, w!("CrosshairOverlay"), Some(overlay_wnd_proc))?;
             register_class(instance, w!("CrosshairToolbox"), Some(toolbox_wnd_proc))?;
-            let _ = MagInitialize();
-
             let overlay_hwnd = CreateWindowExW(
                 WS_EX_LAYERED
                     | WS_EX_TRANSPARENT
@@ -447,48 +450,11 @@ mod windows_overlay {
                 None,
             )?;
 
-            let zoom_host_hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                w!("CrosshairOverlay"),
-                w!("CrosshairZoomHost"),
-                WS_POPUP,
-                0,
-                0,
-                320,
-                180,
-                None,
-                None,
-                Some(instance),
-                None,
-            )?;
-
-            let zoom_mag_hwnd = CreateWindowExW(
-                Default::default(),
-                WC_MAGNIFIER,
-                w!("CrosshairZoomMagnifier"),
-                WS_CHILD
-                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
-                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(MS_SHOWMAGNIFIEDCURSOR as u32),
-                0,
-                0,
-                320,
-                180,
-                Some(zoom_host_hwnd),
-                None,
-                Some(instance),
-                None,
-            )?;
-
             let tray_menu = CreatePopupMenu()?;
             let _ = AppendMenuW(tray_menu, MF_STRING, MENU_TOGGLE, w!("Toggle crosshair"));
             let _ = AppendMenuW(tray_menu, MF_STRING, MENU_SHOW, w!("Open settings"));
             let _ = AppendMenuW(tray_menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(tray_menu, MF_STRING, MENU_EXIT, w!("Exit"));
-
-            let keyboard_hook =
-                SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), Some(instance), 0)?;
-            let mouse_hook =
-                SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), Some(instance), 0)?;
 
             {
                 let mut hook_state = HOOK_STATE.lock();
@@ -512,15 +478,16 @@ mod windows_overlay {
                 mouse_trail_hwnd,
                 toolbox_hwnd,
                 pin_hwnd,
-                zoom_host_hwnd,
-                zoom_mag_hwnd,
-                last_zoom_update: Instant::now(),
+                last_pin_update: Instant::now() - Duration::from_secs(1),
                 toolbox_display: None,
                 tray_menu,
-                keyboard_hook,
-                mouse_hook,
+                keyboard_hook: HHOOK::default(),
+                mouse_hook: HHOOK::default(),
                 running,
                 active_pin_thumbnail: None,
+                timer_interval_ms: 500,
+                ui_visible: true,
+                ui_foreground: true,
             });
 
             let _controller_hwnd = CreateWindowExW(
@@ -596,96 +563,64 @@ mod windows_overlay {
                 LRESULT(1)
             }
             WM_CREATE => {
+                CONTROLLER_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
                 if let Some(runtime) = runtime_mut(hwnd) {
                     let _ = add_tray_icon(hwnd);
                     let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_CONTROL | MOD_ALT, b'X' as u32);
-                    let _ = SetTimer(Some(hwnd), TIMER_ID, 33, None);
+                    let _ = SetTimer(Some(hwnd), TIMER_ID, 500, None);
+                    let _ = set_input_hooks_enabled(runtime, false);
                     let _ = refresh_overlay(runtime);
                 }
                 LRESULT(0)
             }
             WM_TIMER => {
                 if let Some(runtime) = runtime_mut(hwnd) {
-                    while let Ok(command) = runtime.rx.try_recv() {
-                        match command {
-                            OverlayCommand::Update(style) => {
-                                runtime.style = style.clone();
-                                HOOK_STATE.lock().current_style = style;
-                                let _ = refresh_overlay(runtime);
-                            }
-                            OverlayCommand::UpdateProfiles(profiles) => {
-                                HOOK_STATE.lock().profiles = profiles;
-                            }
-                            OverlayCommand::UpdateWindowPresets(presets) => {
-                                runtime.window_presets = presets;
-                                let _ = sync_window_hotkeys(hwnd, runtime);
-                            }
-                            OverlayCommand::UpdateWindowFocusPresets(presets) => {
-                                runtime.window_focus_presets = presets;
-                                let _ = sync_window_hotkeys(hwnd, runtime);
-                            }
-                            OverlayCommand::UpdateWindowExpandControls(controls) => {
-                                HOOK_STATE.lock().window_expand_controls = controls;
-                            }
-                            OverlayCommand::UpdatePinPresets(presets) => {
-                                let mut hook_state = HOOK_STATE.lock();
-                                hook_state.pin_presets = presets.clone();
-                                runtime.pin_presets = presets;
-                                if let Some(active_id) = hook_state.active_pin_preset_id
-                                    && !hook_state.pin_presets.iter().any(|preset| preset.id == active_id)
-                                {
-                                    hook_state.active_pin_preset_id = None;
-                                }
-                            }
-                            OverlayCommand::UpdateMousePathPresets(presets) => {
-                                HOOK_STATE.lock().mouse_path_presets = presets.clone();
-                                runtime.mouse_path_presets = presets;
-                            }
-                            OverlayCommand::UpdateZoomPresets(presets) => {
-                                let mut hook_state = HOOK_STATE.lock();
-                                hook_state.zoom_presets = presets;
-                                if let Some(active_id) = hook_state.active_zoom_preset_id
-                                    && !hook_state
-                                        .zoom_presets
-                                        .iter()
-                                        .any(|preset| preset.id == active_id)
-                                {
-                                    hook_state.active_zoom_preset_id = None;
-                                }
-                            }
-                            OverlayCommand::UpdateToolboxPresets(presets) => {
-                                HOOK_STATE.lock().toolbox_presets = presets;
-                            }
-                            OverlayCommand::UpdateMacroPresets(presets) => {
-                                runtime.macro_groups = presets;
-                                let _ = sync_macro_hotkeys(hwnd, runtime);
-                            }
-                            OverlayCommand::UpdateAudioSettings(settings) => {
-                                let mut hook_state = HOOK_STATE.lock();
-                                hook_state.sound_presets = settings.presets.clone();
-                                hook_state.sound_library = settings.library.clone();
-                                runtime.audio_settings = settings;
-                            }
-                            OverlayCommand::SetMacrosMasterEnabled(enabled) => {
-                                HOOK_STATE.lock().macros_master_enabled = enabled;
-                            }
-                            OverlayCommand::SetUiVisible(visible) => {
-                                if visible {
-                                    show_ui_window_native();
-                                } else {
-                                    hide_ui_window_native();
-                                }
-                            }
-                            OverlayCommand::Exit => {
-                                let _ = runtime.ui_tx.send(UiCommand::Exit);
-                                let _ = shutdown_application(hwnd, runtime);
-                            }
+                    process_pending_commands(hwnd, runtime);
+                    let ui_foreground = is_ui_in_foreground();
+                    if ui_foreground != runtime.ui_foreground {
+                        runtime.ui_foreground = ui_foreground;
+                        let _ = set_input_hooks_enabled(runtime, desired_hooks_enabled(runtime));
+                        let _ = refresh_overlay(runtime);
+                        if ui_foreground {
+                            let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
+                            let _ = ShowWindow(runtime.toolbox_hwnd, SW_HIDE);
+                            let _ = ShowWindow(runtime.mouse_trail_hwnd, SW_HIDE);
+                        } else {
+                            let _ = refresh_pin_overlay(runtime);
+                            let _ = refresh_toolbox(runtime);
+                            let _ = refresh_mouse_record_trail(runtime);
                         }
                     }
-                    let _ = refresh_pin_overlay(runtime);
-                    let _ = refresh_zoom(runtime);
-                    let _ = refresh_toolbox(runtime);
-                    let _ = refresh_mouse_record_trail(runtime);
+                    if !is_ui_in_foreground() {
+                        let pin_active = runtime.active_pin_thumbnail.is_some()
+                            || HOOK_STATE.lock().active_pin_preset_id.is_some();
+                        if pin_active {
+                            let _ = refresh_pin_overlay(runtime);
+                        }
+
+                        let toolbox_active =
+                            TOOLBOX_DISPLAY.lock().is_some() || runtime.toolbox_display.is_some();
+                        if toolbox_active {
+                            let _ = refresh_toolbox(runtime);
+                        }
+
+                        let mouse_recording_active = MOUSE_RECORDING.lock().is_some();
+                        let mouse_trail_visible =
+                            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(runtime.mouse_trail_hwnd)
+                                .as_bool();
+                        if mouse_recording_active || mouse_trail_visible {
+                            let _ = refresh_mouse_record_trail(runtime);
+                        }
+                    }
+
+                    refresh_overlay_timer(hwnd, runtime);
+                }
+                LRESULT(0)
+            }
+            WMAPP_PROCESS_QUEUE => {
+                if let Some(runtime) = runtime_mut(hwnd) {
+                    process_pending_commands(hwnd, runtime);
+                    refresh_overlay_timer(hwnd, runtime);
                 }
                 LRESULT(0)
             }
@@ -742,10 +677,13 @@ mod windows_overlay {
                             let _ = refresh_overlay(runtime);
                         }
                         MENU_SHOW => {
+                            mark_ui_visible(runtime, true);
+                            refresh_overlay_timer(hwnd, runtime);
                             show_ui_window_native();
                             let _ = runtime.ui_tx.send(UiCommand::ShowWindow);
                         }
                         MENU_EXIT => {
+                            platform::show_goodbye_popup();
                             let _ = runtime.ui_tx.send(UiCommand::Exit);
                             let _ = shutdown_application(hwnd, runtime);
                         }
@@ -774,6 +712,8 @@ mod windows_overlay {
                     }
                     WM_LBUTTONUP => {
                         if let Some(runtime) = runtime_mut(hwnd) {
+                            mark_ui_visible(runtime, true);
+                            refresh_overlay_timer(hwnd, runtime);
                             show_ui_window_native();
                             let _ = runtime.ui_tx.send(UiCommand::ShowWindow);
                         }
@@ -783,6 +723,7 @@ mod windows_overlay {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                CONTROLLER_HWND.store(0, Ordering::Relaxed);
                 let _ = KillTimer(Some(hwnd), TIMER_ID);
                 unregister_all_hotkeys(hwnd, runtime_mut(hwnd));
                 let _ = Shell_NotifyIconW(NIM_DELETE, &notify_icon(hwnd));
@@ -791,17 +732,12 @@ mod windows_overlay {
                     let _ = DestroyMenu(runtime.tray_menu);
                     let _ = ShowWindow(runtime.overlay_hwnd, SW_HIDE);
                     let _ = ShowWindow(runtime.toolbox_hwnd, SW_HIDE);
-                    let _ = ShowWindow(runtime.zoom_host_hwnd, SW_HIDE);
-                    let _ = UnhookWindowsHookEx(runtime.keyboard_hook);
-                    let _ = UnhookWindowsHookEx(runtime.mouse_hook);
-                    let _ = MagUninitialize();
+                    let _ = set_input_hooks_enabled(runtime, false);
                 }
                 let mut hook_state = HOOK_STATE.lock();
                 hook_state.ui_tx = None;
                 hook_state.window_presets.clear();
                 hook_state.window_expand_controls = WindowExpandControls::default();
-                hook_state.zoom_presets.clear();
-                hook_state.active_zoom_preset_id = None;
                 hook_state.macro_groups.clear();
                 hook_state.locked_inputs.clear();
                 hook_state.locked_mouse_count = 0;
@@ -844,6 +780,9 @@ mod windows_overlay {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if code == HC_ACTION as i32 && is_ui_in_foreground() {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
         if code == HC_ACTION as i32 {
             let info = *(lparam.0 as *const KBDLLHOOKSTRUCT);
             let msg = wparam.0 as u32;
@@ -888,6 +827,9 @@ mod windows_overlay {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if code == HC_ACTION as i32 && is_ui_in_foreground() {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
         if code == HC_ACTION as i32 {
             let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
             let injected = info.flags & 0x01 != 0;
@@ -895,9 +837,6 @@ mod windows_overlay {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
             let message = wparam.0 as u32;
-            if is_ui_in_foreground() && matches!(message, WM_XBUTTONDOWN | WM_XBUTTONUP) {
-                return CallNextHookEx(None, code, wparam, lparam);
-            }
             record_mouse_event(message, &info);
             let mouse_lock_active = is_mouse_locked();
             if mouse_lock_active {
@@ -1085,43 +1024,6 @@ mod windows_overlay {
         let hook_state = HOOK_STATE.lock();
         let mut matched_any_window = false;
         let mut window_actions = Vec::new();
-        let mut zoom_toggle_id = None;
-        for preset in &hook_state.zoom_presets {
-            if !preset.enabled {
-                continue;
-            }
-            if !window_focus_matches(
-                preset.target_window_title.as_deref(),
-                &preset.extra_target_window_titles,
-                false,
-            ) {
-                continue;
-            }
-            if let Some(hotkey) = preset.hotkey.as_ref()
-                && hotkey::binding_matches(
-                    hotkey,
-                    &binding.key,
-                    binding.ctrl,
-                    binding.alt,
-                    binding.shift,
-                    binding.win,
-                )
-                && !is_repeat
-            {
-                zoom_toggle_id = Some(preset.id);
-                break;
-            }
-        }
-        if let Some(preset_id) = zoom_toggle_id {
-            drop(hook_state);
-            let mut hook_state = HOOK_STATE.lock();
-            if hook_state.active_zoom_preset_id == Some(preset_id) {
-                hook_state.active_zoom_preset_id = None;
-            } else {
-                hook_state.active_zoom_preset_id = Some(preset_id);
-            }
-            return Some(false);
-        }
         for preset in &hook_state.window_presets {
             if !preset.enabled {
                 continue;
@@ -1538,6 +1440,93 @@ mod windows_overlay {
         }
     }
 
+    unsafe fn process_pending_commands(hwnd: HWND, runtime: &mut Runtime) {
+        while let Ok(command) = runtime.rx.try_recv() {
+            match command {
+                OverlayCommand::Update(style) => {
+                    runtime.style = style.clone();
+                    HOOK_STATE.lock().current_style = style;
+                    let _ = refresh_overlay(runtime);
+                }
+                OverlayCommand::UpdateProfiles(profiles) => {
+                    HOOK_STATE.lock().profiles = profiles;
+                }
+                OverlayCommand::UpdateWindowPresets(presets) => {
+                    runtime.window_presets = presets;
+                    let _ = sync_window_hotkeys(hwnd, runtime);
+                }
+                OverlayCommand::UpdateWindowFocusPresets(presets) => {
+                    runtime.window_focus_presets = presets;
+                    let _ = sync_window_hotkeys(hwnd, runtime);
+                }
+                OverlayCommand::UpdateWindowExpandControls(controls) => {
+                    HOOK_STATE.lock().window_expand_controls = controls;
+                }
+                OverlayCommand::UpdatePinPresets(presets) => {
+                    let mut hook_state = HOOK_STATE.lock();
+                    hook_state.pin_presets = presets.clone();
+                    runtime.pin_presets = presets;
+                    if let Some(active_id) = hook_state.active_pin_preset_id
+                        && !hook_state.pin_presets.iter().any(|preset| preset.id == active_id)
+                    {
+                        hook_state.active_pin_preset_id = None;
+                    }
+                }
+                OverlayCommand::UpdateMousePathPresets(presets) => {
+                    HOOK_STATE.lock().mouse_path_presets = presets.clone();
+                    runtime.mouse_path_presets = presets;
+                }
+                OverlayCommand::UpdateToolboxPresets(presets) => {
+                    HOOK_STATE.lock().toolbox_presets = presets;
+                }
+                OverlayCommand::UpdateMacroPresets(presets) => {
+                    runtime.macro_groups = presets;
+                    let _ = sync_macro_hotkeys(hwnd, runtime);
+                }
+                OverlayCommand::UpdateAudioSettings(settings) => {
+                    let mut hook_state = HOOK_STATE.lock();
+                    hook_state.sound_presets = settings.presets.clone();
+                    hook_state.sound_library = settings.library.clone();
+                    runtime.audio_settings = settings;
+                }
+                OverlayCommand::SetMacrosMasterEnabled(enabled) => {
+                    HOOK_STATE.lock().macros_master_enabled = enabled;
+                }
+                OverlayCommand::SetUiVisible(visible) => {
+                    runtime.ui_visible = visible;
+                    if visible {
+                        let _ = set_input_hooks_enabled(runtime, desired_hooks_enabled(runtime));
+                        let _ = ShowWindow(runtime.overlay_hwnd, SW_HIDE);
+                        let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
+                        let _ = ShowWindow(runtime.toolbox_hwnd, SW_HIDE);
+                        let _ = ShowWindow(runtime.mouse_trail_hwnd, SW_HIDE);
+                    } else {
+                        let _ = set_input_hooks_enabled(runtime, desired_hooks_enabled(runtime));
+                        hide_ui_window_native();
+                        let _ = refresh_overlay(runtime);
+                        let _ = refresh_pin_overlay(runtime);
+                        let _ = refresh_toolbox(runtime);
+                    }
+                }
+                OverlayCommand::Exit => {
+                    let _ = runtime.ui_tx.send(UiCommand::Exit);
+                    let _ = shutdown_application(hwnd, runtime);
+                }
+            }
+        }
+    }
+
+    unsafe fn mark_ui_visible(runtime: &mut Runtime, visible: bool) {
+        runtime.ui_visible = visible;
+        let _ = set_input_hooks_enabled(runtime, desired_hooks_enabled(runtime));
+        if visible {
+            let _ = ShowWindow(runtime.overlay_hwnd, SW_HIDE);
+            let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
+            let _ = ShowWindow(runtime.toolbox_hwnd, SW_HIDE);
+            let _ = ShowWindow(runtime.mouse_trail_hwnd, SW_HIDE);
+        }
+    }
+
     unsafe fn refresh_overlay(runtime: &mut Runtime) -> Result<()> {
         if !runtime.style.enabled {
             let _ = ShowWindow(runtime.overlay_hwnd, SW_HIDE);
@@ -1582,21 +1571,26 @@ mod windows_overlay {
 
     fn refresh_mouse_record_trail(runtime: &mut Runtime) -> Result<()> {
         let points = {
-            let guard = MOUSE_RECORDING.lock();
-            guard
-                .as_ref()
-                .map(|session| {
-                    session
-                        .events
-                        .iter()
-                        .filter(|event| matches!(event.kind, MousePathEventKind::Move))
-                        .map(|event| POINT {
-                            x: event.x,
-                            y: event.y,
-                        })
-                        .collect::<Vec<_>>()
+            let mut guard = MOUSE_RECORDING.lock();
+            let Some(session) = guard.as_mut() else {
+                unsafe {
+                    let _ = ShowWindow(runtime.mouse_trail_hwnd, SW_HIDE);
+                }
+                return Ok(());
+            };
+            if !session.dirty {
+                return Ok(());
+            }
+            session.dirty = false;
+            session
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, MousePathEventKind::Move))
+                .map(|event| POINT {
+                    x: event.x,
+                    y: event.y,
                 })
-                .unwrap_or_default()
+                .collect::<Vec<_>>()
         };
 
         if points.len() < 2 {
@@ -1609,79 +1603,64 @@ mod windows_overlay {
         unsafe { paint_mouse_trail(runtime.mouse_trail_hwnd, &points) }
     }
 
-    fn refresh_zoom(runtime: &mut Runtime) -> Result<()> {
-        let active = {
-            let hook_state = HOOK_STATE.lock();
-            hook_state
-                .active_zoom_preset_id
-                .and_then(|id| hook_state.zoom_presets.iter().find(|preset| preset.id == id).cloned())
-        };
-
-        let Some(preset) = active else {
-            unsafe {
-                let _ = ShowWindow(runtime.zoom_host_hwnd, SW_HIDE);
-            }
-            return Ok(());
-        };
-
-        if !window_focus_matches(
-            preset.target_window_title.as_deref(),
-            &preset.extra_target_window_titles,
-            false,
-        ) {
-            unsafe {
-                let _ = ShowWindow(runtime.zoom_host_hwnd, SW_HIDE);
-            }
-            return Ok(());
+    fn desired_timer_interval_ms(runtime: &Runtime) -> u32 {
+        if is_ui_in_foreground() {
+            return 100;
         }
 
-        let fps = preset.fps.max(1);
-        let min_frame = Duration::from_secs_f32(1.0 / fps as f32);
-        if runtime.last_zoom_update.elapsed() < min_frame {
-            return Ok(());
+        let mouse_recording_active = MOUSE_RECORDING.lock().is_some();
+        if mouse_recording_active {
+            return 33;
         }
-        runtime.last_zoom_update = Instant::now();
 
-        let source_width = preset.source_width.max(1);
-        let source_height = preset.source_height.max(1);
-        let target_width = preset.target_width.max(1);
-        let target_height = preset.target_height.max(1);
-        let scale_x = target_width as f32 / source_width as f32;
-        let scale_y = target_height as f32 / source_height as f32;
-        let mut transform = MAGTRANSFORM {
-            v: [scale_x, 0.0, 0.0, 0.0, scale_y, 0.0, 0.0, 0.0, 1.0],
-        };
-        let source = RECT {
-            left: preset.source_x,
-            top: preset.source_y,
-            right: preset.source_x + source_width,
-            bottom: preset.source_y + source_height,
-        };
+        let toolbox_active = TOOLBOX_DISPLAY.lock().is_some() || runtime.toolbox_display.is_some();
+        if toolbox_active {
+            return 100;
+        }
 
-        unsafe {
-            let _ = SetWindowPos(
-                runtime.zoom_host_hwnd,
-                Some(HWND_TOPMOST),
-                preset.target_x,
-                preset.target_y,
-                target_width,
-                target_height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            let _ = SetWindowPos(
-                runtime.zoom_mag_hwnd,
-                None,
-                0,
-                0,
-                target_width,
-                target_height,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-            );
-            let _ = MagSetWindowTransform(runtime.zoom_mag_hwnd, &mut transform);
-            let _ = MagSetWindowSource(runtime.zoom_mag_hwnd, source);
-            let _ = ShowWindow(runtime.zoom_host_hwnd, SW_SHOWNA);
+        let pin_active =
+            runtime.active_pin_thumbnail.is_some() || HOOK_STATE.lock().active_pin_preset_id.is_some();
+        if pin_active {
+            return 100;
+        }
+
+        750
+    }
+
+    fn desired_hooks_enabled(_runtime: &Runtime) -> bool {
+        !is_ui_in_foreground()
+    }
+
+    unsafe fn set_input_hooks_enabled(runtime: &mut Runtime, enabled: bool) -> Result<()> {
+        let instance = GetModuleHandleW(None)?;
+        if enabled {
+            if runtime.keyboard_hook.0.is_null() {
+                runtime.keyboard_hook =
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), Some(instance.into()), 0)?;
+            }
+            if runtime.mouse_hook.0.is_null() {
+                runtime.mouse_hook =
+                    SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), Some(instance.into()), 0)?;
+            }
+        } else {
+            if !runtime.keyboard_hook.0.is_null() {
+                let _ = UnhookWindowsHookEx(runtime.keyboard_hook);
+                runtime.keyboard_hook = HHOOK::default();
+            }
+            if !runtime.mouse_hook.0.is_null() {
+                let _ = UnhookWindowsHookEx(runtime.mouse_hook);
+                runtime.mouse_hook = HHOOK::default();
+            }
         }
         Ok(())
+    }
+
+    unsafe fn refresh_overlay_timer(hwnd: HWND, runtime: &mut Runtime) {
+        let desired = desired_timer_interval_ms(runtime);
+        if desired != runtime.timer_interval_ms {
+            let _ = SetTimer(Some(hwnd), TIMER_ID, desired, None);
+            runtime.timer_interval_ms = desired;
+        }
     }
 
     fn refresh_pin_overlay(runtime: &mut Runtime) -> Result<()> {
@@ -1699,8 +1678,15 @@ mod windows_overlay {
                 }
                 let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
             }
+            runtime.last_pin_update = Instant::now();
             return Ok(());
         };
+
+        if runtime.active_pin_thumbnail.is_some()
+            && runtime.last_pin_update.elapsed() < Duration::from_millis(100)
+        {
+            return Ok(());
+        }
 
         let source = find_target_window_hwnd(
             preset.target_window_title.as_deref(),
@@ -1713,6 +1699,7 @@ mod windows_overlay {
             let source_root = GetAncestor(source, GA_ROOT);
             if !source_root.0.is_null() && window_belongs_to_current_process(source_root) && !is_internal_app_window(source_root) {
                 let _ = ShowWindow(runtime.pin_hwnd, SW_HIDE);
+                runtime.last_pin_update = Instant::now();
                 return Ok(());
             }
 
@@ -1729,6 +1716,8 @@ mod windows_overlay {
                     preset_id: preset.id,
                     source_hwnd: source,
                     thumbnail_id,
+                    last_target_bounds: (i32::MIN, i32::MIN, i32::MIN, i32::MIN),
+                    last_source_crop: None,
                 });
             }
 
@@ -1745,19 +1734,10 @@ mod windows_overlay {
                 )
             };
 
-            let _ = SetWindowPos(
-                runtime.pin_hwnd,
-                Some(HWND_TOPMOST),
-                target_x,
-                target_y,
-                target_w,
-                target_h,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-
             if let Some(active) = runtime.active_pin_thumbnail.as_ref() {
                 let mut source_flags = DWM_TNP_SOURCECLIENTAREAONLY;
                 let mut source_rect_crop = RECT::default();
+                let mut source_crop_key = None;
                 if preset.use_source_crop {
                     let source_width = (source_rect.right - source_rect.left).max(1);
                     let source_height = (source_rect.bottom - source_rect.top).max(1);
@@ -1777,29 +1757,49 @@ mod windows_overlay {
                         right: crop_x + crop_w,
                         bottom: crop_y + crop_h,
                     };
+                    source_crop_key = Some((crop_x, crop_y, crop_w, crop_h));
                     source_flags |= DWM_TNP_RECTSOURCE;
                 }
-                let properties = DWM_THUMBNAIL_PROPERTIES {
-                    dwFlags: DWM_TNP_RECTDESTINATION
-                        | DWM_TNP_VISIBLE
-                        | DWM_TNP_OPACITY
-                        | source_flags,
-                    rcDestination: RECT {
-                        left: 0,
-                        top: 0,
-                        right: target_w,
-                        bottom: target_h,
-                    },
-                    rcSource: source_rect_crop,
-                    opacity: 255,
-                    fVisible: true.into(),
-                    fSourceClientAreaOnly: false.into(),
-                    ..Default::default()
-                };
-                let _ = DwmUpdateThumbnailProperties(active.thumbnail_id, &properties);
+                let target_bounds = (target_x, target_y, target_w, target_h);
+                let needs_apply =
+                    active.last_target_bounds != target_bounds || active.last_source_crop != source_crop_key;
+                if needs_apply {
+                    let _ = SetWindowPos(
+                        runtime.pin_hwnd,
+                        Some(HWND_TOPMOST),
+                        target_x,
+                        target_y,
+                        target_w,
+                        target_h,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    let properties = DWM_THUMBNAIL_PROPERTIES {
+                        dwFlags: DWM_TNP_RECTDESTINATION
+                            | DWM_TNP_VISIBLE
+                            | DWM_TNP_OPACITY
+                            | source_flags,
+                        rcDestination: RECT {
+                            left: 0,
+                            top: 0,
+                            right: target_w,
+                            bottom: target_h,
+                        },
+                        rcSource: source_rect_crop,
+                        opacity: 255,
+                        fVisible: true.into(),
+                        fSourceClientAreaOnly: false.into(),
+                        ..Default::default()
+                    };
+                    let _ = DwmUpdateThumbnailProperties(active.thumbnail_id, &properties);
+                    if let Some(active_mut) = runtime.active_pin_thumbnail.as_mut() {
+                        active_mut.last_target_bounds = target_bounds;
+                        active_mut.last_source_crop = source_crop_key;
+                    }
+                }
             }
             let _ = ShowWindow(runtime.pin_hwnd, SW_SHOWNA);
         }
+        runtime.last_pin_update = Instant::now();
         Ok(())
     }
 
@@ -2182,6 +2182,7 @@ mod windows_overlay {
     fn send_overlay_command(command: OverlayCommand) {
         if let Some(tx) = OVERLAY_COMMAND_TX.lock().clone() {
             let _ = tx.send(command);
+            wake_command_queue();
         }
     }
 
@@ -2326,7 +2327,19 @@ mod windows_overlay {
     }
 
     fn macro_stop_requested(preset_id: u32, stop_immediately_on_retrigger: bool) -> bool {
-        stop_immediately_on_retrigger && STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id)
+        if !STOP_REQUESTED_MACRO_PRESETS.lock().contains(&preset_id) {
+            return false;
+        }
+        if stop_immediately_on_retrigger {
+            return true;
+        }
+        HOOK_STATE
+            .lock()
+            .macro_groups
+            .iter()
+            .flat_map(|group| group.presets.iter())
+            .find(|preset| preset.id == preset_id)
+            .is_some_and(|preset| preset.stop_on_retrigger_immediate)
     }
 
     fn sleep_for_mouse_path_delay(
@@ -2531,19 +2544,11 @@ mod windows_overlay {
         Ok(())
     }
 
-    fn enable_zoom_preset(spec: &str) -> Result<()> {
-        let preset_id = spec.trim().parse::<u32>().context("Zoom preset id is invalid")?;
-        let mut hook_state = HOOK_STATE.lock();
-        if !hook_state.zoom_presets.iter().any(|preset| preset.id == preset_id) {
-            bail!("Zoom preset was not found");
-        }
-        hook_state.active_zoom_preset_id = Some(preset_id);
-        Ok(())
+    fn enable_zoom_preset(_spec: &str) -> Result<()> {
+        bail!("Zoom was removed")
     }
 
-    fn disable_zoom_overlay() {
-        HOOK_STATE.lock().active_zoom_preset_id = None;
-    }
+    fn disable_zoom_overlay() {}
 
     fn set_macro_preset_enabled(spec: &str, enabled: bool) -> Result<()> {
         let preset_id = spec.trim().parse::<u32>().context("Macro preset id is invalid")?;
@@ -4072,76 +4077,27 @@ mod windows_overlay {
             if app.0.is_null() {
                 return;
             }
-            let foreground = GetForegroundWindow();
-            let current_thread = GetCurrentThreadId();
-            let app_thread = GetWindowThreadProcessId(app, None);
-            let foreground_thread = if foreground.0.is_null() {
-                0
-            } else {
-                GetWindowThreadProcessId(foreground, None)
-            };
-            let attach_foreground = foreground_thread != 0 && foreground_thread != current_thread;
-            let attach_app = app_thread != 0 && app_thread != current_thread;
-
-            if attach_foreground {
-                let _ = AttachThreadInput(foreground_thread, current_thread, true);
-            }
-            if attach_app {
-                let _ = AttachThreadInput(app_thread, current_thread, true);
-            }
-            let _ = ShowWindow(app, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
-            let _ = ShowWindow(app, windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL);
-            let _ = ShowWindow(app, SW_RESTORE);
             let mut rect = RECT::default();
             if GetWindowRect(app, &mut rect).is_ok() {
-                let width = (rect.right - rect.left).max(0);
-                let height = (rect.bottom - rect.top).max(0);
-                if width < 32 || height < 32 {
-                    let desired_w = 980;
-                    let desired_h = 980;
-                    let screen_w = GetSystemMetrics(SM_CXSCREEN).max(1);
-                    let screen_h = GetSystemMetrics(SM_CYSCREEN).max(1);
-                    let pos_x = ((screen_w - desired_w) / 2).max(0);
-                    let pos_y = ((screen_h - desired_h) / 2).max(0);
-                    let _ = SetWindowPos(
-                        app,
-                        None,
-                        pos_x,
-                        pos_y,
-                        desired_w,
-                        desired_h,
-                        SWP_NOZORDER | SWP_SHOWWINDOW,
-                    );
-                }
+                let width = (rect.right - rect.left).max(1);
+                let height = (rect.bottom - rect.top).max(1);
+                let center_x = rect.left + width / 2;
+                let center_y = rect.top + height / 2;
+                let start_w = width.min(160).max(96);
+                let start_h = height.min(160).max(96);
+                let start_x = center_x - start_w / 2;
+                let start_y = center_y - start_h / 2;
+                let _ = SetWindowPos(
+                    app,
+                    None,
+                    start_x,
+                    start_y,
+                    start_w,
+                    start_h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
-            let _ = SetWindowPos(
-                app,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            let _ = SetWindowPos(
-                app,
-                Some(HWND_NOTOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            let _ = BringWindowToTop(app);
-            let _ = SetForegroundWindow(app);
-            let _ = SetActiveWindow(app);
-            let _ = SetFocus(Some(app));
-            if attach_app {
-                let _ = AttachThreadInput(app_thread, current_thread, false);
-            }
-            if attach_foreground {
-                let _ = AttachThreadInput(foreground_thread, current_thread, false);
-            }
+            let _ = ShowWindow(app, SW_SHOWNA);
         }
     }
 
@@ -4686,8 +4642,12 @@ mod windows_overlay {
         if let Some(active) = &runtime.active_pin_thumbnail {
             let _ = unsafe { DwmUnregisterThumbnail(active.thumbnail_id) };
         }
-        let _ = unsafe { UnhookWindowsHookEx(runtime.keyboard_hook) };
-        let _ = unsafe { UnhookWindowsHookEx(runtime.mouse_hook) };
+        if !runtime.keyboard_hook.0.is_null() {
+            let _ = unsafe { UnhookWindowsHookEx(runtime.keyboard_hook) };
+        }
+        if !runtime.mouse_hook.0.is_null() {
+            let _ = unsafe { UnhookWindowsHookEx(runtime.mouse_hook) };
+        }
         {
             let mut hook_state = HOOK_STATE.lock();
             hook_state.window_presets.clear();
@@ -5146,7 +5106,7 @@ mod fallback {
     use crate::{
         model::{
             AudioSettings, CrosshairStyle, MacroGroup, ProfileRecord, WindowExpandControls,
-            WindowFocusPreset, WindowPreset, ZoomPreset,
+            WindowFocusPreset, WindowPreset,
         },
         storage::AppPaths,
     };
@@ -5158,7 +5118,6 @@ mod fallback {
         UpdateWindowPresets(Vec<WindowPreset>),
         UpdateWindowFocusPresets(Vec<WindowFocusPreset>),
         UpdateWindowExpandControls(WindowExpandControls),
-        UpdateZoomPresets(Vec<ZoomPreset>),
         UpdateMacroPresets(Vec<MacroGroup>),
         UpdateAudioSettings(AudioSettings),
         SetMacrosMasterEnabled(bool),
@@ -5177,6 +5136,8 @@ mod fallback {
     impl OverlayHandle {
         pub fn send(&self, _command: OverlayCommand) {}
     }
+
+    pub fn wake_command_queue() {}
 
     pub fn start(
         _paths: AppPaths,

@@ -646,6 +646,7 @@ dependencies = [
  "image",
  "once_cell",
  "parking_lot",
+ "raw-window-handle",
  "reqwest",
  "resvg",
  "rfd",

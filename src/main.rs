@@ -15,12 +15,23 @@ mod window_list;
 use anyhow::Result;
 use crossbeam_channel::unbounded;
 
-use crate::{overlay::OverlayCommand, storage::AppPaths, ui::CrosshairApp};
+use crate::{
+    overlay::OverlayCommand,
+    storage::AppPaths,
+    ui::{CrosshairApp, PopupBlobApp, PopupBlobKind},
+};
 
 #[cfg(not(windows))]
 compile_error!("This application currently supports Windows only.");
 
 fn main() -> Result<()> {
+    if std::env::args().any(|arg| arg == "--already-running-popup") {
+        return run_popup_blob(PopupBlobKind::AlreadyRunning);
+    }
+    if std::env::args().any(|arg| arg == "--goodbye-popup") {
+        return run_popup_blob(PopupBlobKind::Goodbye);
+    }
+
     if platform::relaunch_as_admin_if_needed()? {
         return Ok(());
     }
@@ -50,9 +61,6 @@ fn main() -> Result<()> {
     ));
     overlay.send(OverlayCommand::UpdateWindowFocusPresets(
         state.window_focus_presets.clone(),
-    ));
-    overlay.send(OverlayCommand::UpdateZoomPresets(
-        state.zoom_presets.clone(),
     ));
     overlay.send(OverlayCommand::UpdateMacroPresets(
         state.macro_groups.clone(),
@@ -88,6 +96,34 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             ui::configure_fonts(&cc.egui_ctx);
             Ok(Box::new(CrosshairApp::new(paths, state, overlay_tx, ui_rx)))
+        }),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(())
+}
+
+fn run_popup_blob(kind: PopupBlobKind) -> Result<()> {
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("MacroNest")
+            .with_inner_size([560.0, 260.0])
+            .with_min_inner_size([560.0, 260.0])
+            .with_max_inner_size([560.0, 260.0])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_active(true),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "MacroNest",
+        native_options,
+        Box::new(move |cc| {
+            ui::configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(PopupBlobApp::new(kind, crate::model::UiThemeMode::Dark)))
         }),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;

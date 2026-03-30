@@ -61,8 +61,6 @@ struct MacroStepDragPayload {
 }
 
 struct CloseToTrayAnimation {
-    start_outer_rect: egui::Rect,
-    start_inner_size: egui::Vec2,
     started_at: f64,
     duration_sec: f64,
 }
@@ -138,6 +136,164 @@ pub fn configure_fonts(ctx: &egui::Context) {
     });
 }
 
+#[derive(Clone, Copy)]
+pub enum PopupBlobKind {
+    AlreadyRunning,
+    Goodbye,
+}
+
+pub struct PopupBlobApp {
+    kind: PopupBlobKind,
+    theme: UiThemeMode,
+    started_at: Option<f64>,
+    duration_sec: f64,
+    center_next_frame: bool,
+}
+
+impl PopupBlobApp {
+    pub fn new(kind: PopupBlobKind, theme: UiThemeMode) -> Self {
+        Self {
+            kind,
+            theme,
+            started_at: None,
+            duration_sec: match kind {
+                PopupBlobKind::AlreadyRunning => 1.55,
+                PopupBlobKind::Goodbye => 1.8,
+            },
+            center_next_frame: true,
+        }
+    }
+
+    fn popup_palette(&self) -> (Color32, Color32, Color32, Color32, Color32) {
+        match self.theme {
+            UiThemeMode::Dark => (
+                Color32::from_rgb(108, 244, 226),
+                Color32::from_rgb(255, 120, 186),
+                Color32::from_rgb(112, 170, 255),
+                Color32::from_rgba_premultiplied(4, 8, 18, 230),
+                Color32::from_rgba_premultiplied(12, 18, 30, 188),
+            ),
+            UiThemeMode::Light => (
+                Color32::from_rgb(58, 196, 182),
+                Color32::from_rgb(236, 102, 152),
+                Color32::from_rgb(92, 144, 238),
+                Color32::from_rgba_premultiplied(245, 250, 255, 228),
+                Color32::from_rgba_premultiplied(220, 236, 246, 190),
+            ),
+        }
+    }
+
+    fn render_message_popup(&self, ctx: &egui::Context, progress: f32) {
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("message-popup"),
+        ));
+        let center = rect.center();
+        let time = ctx.input(|input| input.time) as f32;
+        let ease_in = 1.0 - (1.0 - (progress / 0.32).clamp(0.0, 1.0)).powi(3);
+        let shatter = ((progress - 0.48) / 0.52).clamp(0.0, 1.0);
+        let shatter = 1.0 - (1.0 - shatter).powi(3);
+        let scale = egui::lerp(0.18..=1.0, ease_in) * (1.0 - shatter * 0.28);
+        let fade = 1.0 - shatter * 0.82;
+        let (neon_cyan, neon_pink, neon_blue, dark_fill, mid_fill) = self.popup_palette();
+        let (title, message) = match self.kind {
+            PopupBlobKind::AlreadyRunning => ("MacroNest", "Already running in tray"),
+            PopupBlobKind::Goodbye => ("MacroNest", "Goodbye, see you soon"),
+        };
+
+        for layer in 0..3 {
+            let layer_t = layer as f32 / 2.0;
+            let radius_x = rect.width() * (0.22 + layer_t * 0.12) * scale;
+            let radius_y = rect.height() * (0.24 + layer_t * 0.08) * scale;
+            let mut points = Vec::with_capacity(96);
+            for step in 0..96 {
+                let angle = step as f32 / 96.0 * std::f32::consts::TAU;
+                let wobble = 1.0
+                    + 0.13 * (angle * 3.0 + time * (0.9 + layer_t * 0.3)).sin()
+                    + 0.07 * (angle * 5.0 - time * (0.65 + layer_t * 0.22)).cos();
+                let blast = 1.0 + shatter * (0.12 + layer_t * 0.08);
+                points.push(egui::pos2(
+                    center.x + angle.cos() * radius_x * wobble * blast,
+                    center.y + angle.sin() * radius_y * wobble * blast,
+                ));
+            }
+            let fill = if layer == 0 {
+                Color32::from_rgba_premultiplied(dark_fill.r(), dark_fill.g(), dark_fill.b(), (230.0 * fade) as u8)
+            } else if layer == 1 {
+                Color32::from_rgba_premultiplied(mid_fill.r(), mid_fill.g(), mid_fill.b(), (168.0 * fade) as u8)
+            } else {
+                Color32::from_rgba_premultiplied(neon_pink.r(), neon_pink.g(), neon_pink.b(), (52.0 * fade) as u8)
+            };
+            let stroke = if layer == 2 { neon_pink } else { neon_blue };
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                fill,
+                egui::Stroke::new(
+                    1.4 - layer as f32 * 0.2,
+                    Color32::from_rgba_premultiplied(stroke.r(), stroke.g(), stroke.b(), (110.0 * fade) as u8),
+                ),
+            ));
+        }
+
+        for shard_index in 0..18 {
+            let frac = shard_index as f32 / 18.0;
+            let angle = frac * std::f32::consts::TAU + time * 0.6;
+            let distance = rect.width().min(rect.height()) * 0.28 * shatter;
+            let pos = egui::pos2(
+                center.x + angle.cos() * distance,
+                center.y + angle.sin() * distance * 0.72,
+            );
+            let color = if shard_index % 2 == 0 { neon_cyan } else { neon_pink };
+            painter.circle_filled(
+                pos,
+                (1.2 + (shard_index % 4) as f32 * 0.45) * (0.8 + shatter * 0.4),
+                Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), (140.0 * (1.0 - shatter * 0.35)) as u8),
+            );
+        }
+
+        painter.text(
+            egui::pos2(center.x, rect.top() + rect.height() * 0.38),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(26.0),
+            Color32::from_rgba_premultiplied(244, 247, 255, (255.0 * fade) as u8),
+        );
+        painter.text(
+            egui::pos2(center.x, rect.top() + rect.height() * 0.62),
+            egui::Align2::CENTER_CENTER,
+            message,
+            egui::FontId::proportional(16.0),
+            Color32::from_rgba_premultiplied(208, 220, 255, (220.0 * fade) as u8),
+        );
+    }
+
+}
+
+impl eframe::App for PopupBlobApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.center_next_frame {
+            if let Some(center_cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                ctx.send_viewport_cmd(center_cmd);
+                self.center_next_frame = false;
+            }
+        }
+        let now = ctx.input(|input| input.time);
+        let started_at = self.started_at.get_or_insert(now);
+        let progress = ((now - *started_at) / self.duration_sec).clamp(0.0, 1.0) as f32;
+        if progress >= 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        ctx.request_repaint();
+        self.render_message_popup(ctx, progress);
+    }
+}
+
 pub struct CrosshairApp {
     pub paths: AppPaths,
     pub state: AppState,
@@ -156,6 +312,8 @@ pub struct CrosshairApp {
     startup_sound_played: bool,
     show_startup_audio_editor: bool,
     show_exit_audio_editor: bool,
+    startup_sound_collapsed: bool,
+    exit_sound_collapsed: bool,
     audio_waveforms: HashMap<String, Vec<f32>>,
     sound_preset_clip_duration_ms: HashMap<u32, Option<u64>>,
     show_sound_preset_audio_editor: HashSet<u32>,
@@ -183,6 +341,8 @@ pub struct CrosshairApp {
     hidden_window_outer_pos: Option<egui::Pos2>,
     zoom_preview_cache: HashMap<u32, ZoomPreviewCache>,
     active_mouse_record_preset_id: Option<u32>,
+    last_applied_theme: Option<UiThemeMode>,
+    native_shadow_applied: bool,
 }
 
 impl CrosshairApp {
@@ -228,6 +388,8 @@ impl CrosshairApp {
             startup_sound_played: false,
             show_startup_audio_editor: false,
             show_exit_audio_editor: false,
+            startup_sound_collapsed: true,
+            exit_sound_collapsed: true,
             audio_waveforms: HashMap::new(),
             sound_preset_clip_duration_ms: HashMap::new(),
             show_sound_preset_audio_editor: HashSet::new(),
@@ -247,7 +409,7 @@ impl CrosshairApp {
             last_active_panel: initial_active_panel,
             macro_drag_select_anchor: None,
             active_macro_folder_view: None,
-            crosshair_panel_collapsed: false,
+            crosshair_panel_collapsed: true,
             close_to_tray_animation: None,
             open_from_tray_animation: None,
             startup_splash: StartupSplashState {
@@ -258,6 +420,8 @@ impl CrosshairApp {
             hidden_window_outer_pos: None,
             zoom_preview_cache: HashMap::new(),
             active_mouse_record_preset_id: None,
+            last_applied_theme: None,
+            native_shadow_applied: false,
         };
         app.ensure_master_presets();
         app.refresh_audio_waveform(true);
@@ -302,9 +466,6 @@ impl CrosshairApp {
         let _ = self
             .overlay_tx
             .send(OverlayCommand::UpdatePinPresets(self.state.pin_presets.clone()));
-        let _ = self
-            .overlay_tx
-            .send(OverlayCommand::UpdateZoomPresets(self.state.zoom_presets.clone()));
         let _ = self
             .overlay_tx
             .send(OverlayCommand::UpdateMousePathPresets(
@@ -795,17 +956,38 @@ impl CrosshairApp {
         egui::pos2(120.0, 120.0)
     }
 
-    fn apply_theme(&self, ctx: &egui::Context) {
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.last_applied_theme == Some(self.state.ui_theme) {
+            return;
+        }
+
         match self.state.ui_theme {
             UiThemeMode::Dark => {
-                ctx.set_visuals(egui::Visuals::dark());
+                let mut visuals = egui::Visuals::dark();
+                visuals.override_text_color = Some(Color32::from_rgb(232, 238, 248));
+                visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(220, 228, 238);
+                visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(228, 234, 242);
+                visuals.widgets.hovered.fg_stroke.color = Color32::from_rgb(240, 246, 252);
+                visuals.widgets.active.fg_stroke.color = Color32::from_rgb(248, 250, 252);
+                visuals.widgets.open.fg_stroke.color = Color32::from_rgb(240, 246, 252);
+                ctx.set_visuals(visuals);
                 ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
             }
             UiThemeMode::Light => {
-                ctx.set_visuals(egui::Visuals::light());
+                let mut visuals = egui::Visuals::light();
+                visuals.override_text_color = Some(Color32::from_rgb(28, 34, 44));
+                visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(32, 40, 54);
+                visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(28, 36, 48);
+                visuals.widgets.hovered.fg_stroke.color = Color32::from_rgb(18, 26, 40);
+                visuals.widgets.active.fg_stroke.color = Color32::from_rgb(16, 24, 38);
+                visuals.widgets.open.fg_stroke.color = Color32::from_rgb(18, 26, 40);
+                visuals.hyperlink_color = Color32::from_rgb(26, 92, 164);
+                ctx.set_visuals(visuals);
                 ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Light));
             }
         }
+
+        self.last_applied_theme = Some(self.state.ui_theme);
     }
 
     fn cycle_language(&mut self) {
@@ -2513,6 +2695,11 @@ impl CrosshairApp {
             vec2(58.0, 42.0),
             egui::Layout::top_down(egui::Align::Center),
             |ui| {
+                let label_color = if *current == candidate {
+                    ui.visuals().strong_text_color()
+                } else {
+                    ui.visuals().text_color()
+                };
                 let response = ui.add_sized(
                     [34.0, 24.0],
                     Button::new(Self::macro_action_icon_text(candidate))
@@ -2521,7 +2708,7 @@ impl CrosshairApp {
                 ui.label(
                     RichText::new(Self::macro_action_short_label(candidate, language))
                         .size(9.0)
-                        .color(Color32::from_rgb(36, 36, 36)),
+                        .color(label_color),
                 );
                 response
             },
@@ -2636,14 +2823,15 @@ impl CrosshairApp {
                     }
                 }
                 ui.ctx().data_mut(|data| data.insert_temp(popup_id, open));
+                let label_color = if selected {
+                    ui.visuals().strong_text_color()
+                } else {
+                    ui.visuals().text_color()
+                };
                 ui.label(
                     RichText::new(Self::tr_lang(language, "Mouse", "Chuột"))
                         .size(9.0)
-                        .color(if selected {
-                            Color32::from_rgb(24, 96, 48)
-                        } else {
-                            Color32::from_rgb(36, 36, 36)
-                        }),
+                        .color(label_color),
                 );
                 response
             },
@@ -4099,6 +4287,8 @@ impl CrosshairApp {
                     vec2(stage_size, stage_size * 0.92),
                 );
                 let orbit_center = egui::pos2(stage_rect.center().x, stage_rect.top() + stage_rect.height() * 0.34);
+                let square_morph = ((progress - 0.72) / 0.28).clamp(0.0, 1.0);
+                let square_morph = 1.0 - (1.0 - square_morph).powi(3);
                 let aura_layers = [
                     (
                         egui::pos2(orbit_center.x, orbit_center.y + stage_rect.height() * 0.16),
@@ -4123,6 +4313,7 @@ impl CrosshairApp {
                     ),
                 ];
                 for (layer_index, (layer_center, radius_x, radius_y, fill, stroke)) in aura_layers.into_iter().enumerate() {
+                    let target_rect = rect.shrink(10.0 + layer_index as f32 * 10.0);
                     let mut points = Vec::with_capacity(96);
                     for step in 0..96 {
                         let angle = step as f32 / 96.0 * std::f32::consts::TAU;
@@ -4130,15 +4321,42 @@ impl CrosshairApp {
                             + 0.14 * (angle * 3.0 + time * (0.82 + layer_index as f32 * 0.18)).sin()
                             + 0.08 * (angle * 5.0 - time * (0.56 + layer_index as f32 * 0.12)).cos()
                             + 0.03 * (angle * 9.0 + time * 0.7).sin();
-                        points.push(egui::pos2(
+                        let blob_point = egui::pos2(
                             layer_center.x + angle.cos() * radius_x * wobble,
                             layer_center.y + angle.sin() * radius_y * wobble,
+                        );
+                        let side = step / 24;
+                        let side_t = (step % 24) as f32 / 24.0;
+                        let square_point = match side {
+                            0 => egui::pos2(
+                                egui::lerp(target_rect.left()..=target_rect.right(), side_t),
+                                target_rect.top(),
+                            ),
+                            1 => egui::pos2(
+                                target_rect.right(),
+                                egui::lerp(target_rect.top()..=target_rect.bottom(), side_t),
+                            ),
+                            2 => egui::pos2(
+                                egui::lerp(target_rect.right()..=target_rect.left(), side_t),
+                                target_rect.bottom(),
+                            ),
+                            _ => egui::pos2(
+                                target_rect.left(),
+                                egui::lerp(target_rect.bottom()..=target_rect.top(), side_t),
+                            ),
+                        };
+                        points.push(egui::pos2(
+                            egui::lerp(blob_point.x..=square_point.x, square_morph),
+                            egui::lerp(blob_point.y..=square_point.y, square_morph),
                         ));
                     }
                     painter.add(egui::Shape::convex_polygon(
                         points,
                         fill,
-                        egui::Stroke::new(1.9 - layer_index as f32 * 0.28, stroke),
+                        egui::Stroke::new(
+                            (1.9 - layer_index as f32 * 0.28) * (1.0 - square_morph * 0.35),
+                            stroke,
+                        ),
                     ));
                 }
                 for star_index in 0..18 {
@@ -4445,6 +4663,119 @@ impl CrosshairApp {
                     );
                 }
             });
+    }
+
+    fn render_tray_blob_transition(&self, ctx: &egui::Context, progress: f32, opening: bool) {
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(if opening { "open-tray-blob" } else { "close-tray-blob" }),
+        ));
+        let time = ctx.input(|input| input.time) as f32;
+        let center = rect.center();
+        let neon_cyan = Color32::from_rgb(108, 244, 226);
+        let neon_pink = Color32::from_rgb(255, 120, 186);
+        let eased = if opening {
+            let p = progress.clamp(0.0, 1.0);
+            p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
+        } else {
+            1.0 - (1.0 - progress).powi(3)
+        };
+        let scale = if opening {
+            egui::lerp(0.02..=1.28, eased)
+        } else {
+            egui::lerp(1.18..=0.08, eased)
+        };
+        let square_morph = if opening {
+            let p = ((progress - 0.34) / 0.66).clamp(0.0, 1.0);
+            p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
+        } else {
+            0.0
+        };
+        let alpha_scale = if opening {
+            (1.0 - progress * 0.28).clamp(0.0, 1.0)
+        } else {
+            (1.0 - progress * 0.18).clamp(0.0, 1.0)
+        };
+        let aura_layers = [
+            (
+                center,
+                rect.width() * 0.27 * scale,
+                rect.height() * 0.34 * scale,
+                Color32::from_rgba_premultiplied(4, 6, 12, (228.0 * alpha_scale) as u8),
+                Color32::from_rgba_premultiplied(28, 40, 76, (146.0 * alpha_scale) as u8),
+            ),
+            (
+                egui::pos2(center.x - rect.width() * 0.012 * scale, center.y + rect.height() * 0.01 * scale),
+                rect.width() * 0.33 * scale,
+                rect.height() * 0.42 * scale,
+                Color32::from_rgba_premultiplied(8, 12, 22, (190.0 * alpha_scale) as u8),
+                Color32::from_rgba_premultiplied(neon_cyan.r(), neon_cyan.g(), neon_cyan.b(), (82.0 * alpha_scale) as u8),
+            ),
+            (
+                egui::pos2(center.x + rect.width() * 0.016 * scale, center.y + rect.height() * 0.02 * scale),
+                rect.width() * 0.39 * scale,
+                rect.height() * 0.5 * scale,
+                Color32::from_rgba_premultiplied(16, 10, 22, (132.0 * alpha_scale) as u8),
+                Color32::from_rgba_premultiplied(neon_pink.r(), neon_pink.g(), neon_pink.b(), (76.0 * alpha_scale) as u8),
+            ),
+        ];
+        for (layer_index, (layer_center, radius_x, radius_y, fill, stroke)) in aura_layers.into_iter().enumerate() {
+            let rect_scale = if opening {
+                egui::lerp(0.035..=1.0, eased)
+            } else {
+                egui::lerp(1.0..=0.08, eased)
+            };
+            let base_size = vec2(
+                (rect.width() - (24.0 + layer_index as f32 * 22.0)).max(32.0),
+                (rect.height() - (24.0 + layer_index as f32 * 22.0)).max(32.0),
+            );
+            let target_rect = egui::Rect::from_center_size(center, base_size * rect_scale);
+            let mut points = Vec::with_capacity(96);
+            for step in 0..96 {
+                let angle = step as f32 / 96.0 * std::f32::consts::TAU;
+                let wobble = 1.0
+                    + 0.14 * (angle * 3.0 + time * (0.82 + layer_index as f32 * 0.18)).sin()
+                    + 0.08 * (angle * 5.0 - time * (0.56 + layer_index as f32 * 0.12)).cos()
+                    + 0.03 * (angle * 9.0 + time * 0.7).sin();
+                let blob_point = egui::pos2(
+                    layer_center.x + angle.cos() * radius_x * wobble,
+                    layer_center.y + angle.sin() * radius_y * wobble,
+                );
+                let side = step / 24;
+                let side_t = (step % 24) as f32 / 24.0;
+                let square_point = match side {
+                    0 => egui::pos2(
+                        egui::lerp(target_rect.left()..=target_rect.right(), side_t),
+                        target_rect.top(),
+                    ),
+                    1 => egui::pos2(
+                        target_rect.right(),
+                        egui::lerp(target_rect.top()..=target_rect.bottom(), side_t),
+                    ),
+                    2 => egui::pos2(
+                        egui::lerp(target_rect.right()..=target_rect.left(), side_t),
+                        target_rect.bottom(),
+                    ),
+                    _ => egui::pos2(
+                        target_rect.left(),
+                        egui::lerp(target_rect.bottom()..=target_rect.top(), side_t),
+                    ),
+                };
+                points.push(egui::pos2(
+                    egui::lerp(blob_point.x..=square_point.x, square_morph),
+                    egui::lerp(blob_point.y..=square_point.y, square_morph),
+                ));
+            }
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                fill,
+                egui::Stroke::new(
+                    (1.8 - layer_index as f32 * 0.26) * (1.0 - square_morph * 0.38),
+                    stroke,
+                ),
+            ));
+        }
     }
 
     fn render_window_presets_panel(&mut self, ui: &mut egui::Ui) {
@@ -7906,8 +8237,34 @@ impl CrosshairApp {
 
         ui.separator();
         ui.columns(2, |columns| {
+            Self::show_preset_card(&mut columns[0], self.state.audio_settings.startup.enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(Self::tr_lang(language, "Startup Sound", "Ã‚m thanh má»Ÿ app")).strong());
+                    if !self.state.audio_settings.startup.file_path.trim().is_empty() {
+                        ui.monospace(Self::format_ms(
+                            self.state
+                                .audio_settings
+                                .startup
+                                .end_ms
+                                .saturating_sub(self.state.audio_settings.startup.start_ms),
+                        ));
+                    }
+                    if ui
+                        .button(if self.startup_sound_collapsed {
+                            Self::tr_lang(language, "Show", "Hiá»‡n")
+                        } else {
+                            Self::tr_lang(language, "Hide", "áº¨n")
+                        })
+                        .clicked()
+                    {
+                        self.startup_sound_collapsed = !self.startup_sound_collapsed;
+                    }
+                });
+                if self.startup_sound_collapsed {
+                    return;
+                }
             let startup = Self::render_audio_clip_card(
-                &mut columns[0],
+                ui,
                 language,
                 Self::tr_lang(language, "Startup Sound", "Âm thanh mở app"),
                 &mut self.state.audio_settings.startup,
@@ -7925,8 +8282,8 @@ impl CrosshairApp {
             if startup.open_editor {
                 self.open_audio_editor(AudioEditorTarget::Startup);
             }
-            columns[0].add_space(4.0);
-            if columns[0]
+            ui.add_space(4.0);
+            if ui
                 .button(self.tr("Save Startup To Library", "Lưu âm thanh mở app vào thư viện"))
                 .on_hover_text(self.tr(
                     "Save this trimmed startup clip into the reusable sound library.",
@@ -7938,9 +8295,36 @@ impl CrosshairApp {
                 self.save_clip_to_library("Startup", &clip);
                 changed = true;
             }
+            });
 
+            Self::show_preset_card(&mut columns[1], self.state.audio_settings.exit.enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(Self::tr_lang(language, "Exit Sound", "Ã‚m thanh táº¯t app")).strong());
+                    if !self.state.audio_settings.exit.file_path.trim().is_empty() {
+                        ui.monospace(Self::format_ms(
+                            self.state
+                                .audio_settings
+                                .exit
+                                .end_ms
+                                .saturating_sub(self.state.audio_settings.exit.start_ms),
+                        ));
+                    }
+                    if ui
+                        .button(if self.exit_sound_collapsed {
+                            Self::tr_lang(language, "Show", "Hiá»‡n")
+                        } else {
+                            Self::tr_lang(language, "Hide", "áº¨n")
+                        })
+                        .clicked()
+                    {
+                        self.exit_sound_collapsed = !self.exit_sound_collapsed;
+                    }
+                });
+                if self.exit_sound_collapsed {
+                    return;
+                }
             let exit = Self::render_audio_clip_card(
-                &mut columns[1],
+                ui,
                 language,
                 Self::tr_lang(language, "Exit Sound", "Âm thanh tắt app"),
                 &mut self.state.audio_settings.exit,
@@ -7958,8 +8342,8 @@ impl CrosshairApp {
             if exit.open_editor {
                 self.open_audio_editor(AudioEditorTarget::Exit);
             }
-            columns[1].add_space(4.0);
-            if columns[1]
+            ui.add_space(4.0);
+            if ui
                 .button(self.tr("Save Exit To Library", "Lưu âm thanh tắt app vào thư viện"))
                 .on_hover_text(self.tr(
                     "Save this trimmed exit clip into the reusable sound library.",
@@ -7971,6 +8355,7 @@ impl CrosshairApp {
                 self.save_clip_to_library("Exit", &clip);
                 changed = true;
             }
+            });
         });
 
         ui.separator();
@@ -8838,6 +9223,7 @@ impl CrosshairApp {
         if changed {
             self.persist_toolbox_presets();
         }
+
     }
 
     fn animation_min_size() -> egui::Vec2 {
@@ -8932,23 +9318,23 @@ impl CrosshairApp {
 
     fn render_custom_window_border(&self, ctx: &egui::Context) {
         let rect = ctx.content_rect().shrink(0.5);
+
         let stroke = if self.state.ui_theme == UiThemeMode::Dark {
             egui::Stroke::new(1.4, Color32::from_rgb(64, 84, 108))
         } else {
             egui::Stroke::new(1.4, Color32::from_rgb(184, 198, 214))
         };
-        ctx.layer_painter(egui::LayerId::new(
+        let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("window-border"),
-        ))
-        .rect_stroke(rect, 12.0, stroke, egui::StrokeKind::Outside);
+        ));
+        painter.rect_stroke(rect, 16.0, stroke, egui::StrokeKind::Outside);
     }
 
     fn begin_close_to_tray_animation(&mut self, ctx: &egui::Context) {
         if self.close_to_tray_animation.is_some() {
             return;
         }
-
         let viewport = ctx.input(|input| input.viewport().clone());
         if let Some(outer_rect) = viewport.outer_rect {
             let inner_size = viewport
@@ -8958,10 +9344,8 @@ impl CrosshairApp {
             self.hidden_window_inner_size = Some(inner_size);
             self.hidden_window_outer_pos = Some(outer_rect.min);
             self.close_to_tray_animation = Some(CloseToTrayAnimation {
-                start_outer_rect: outer_rect,
-                start_inner_size: inner_size,
                 started_at: ctx.input(|input| input.time),
-                duration_sec: 0.20,
+                duration_sec: 0.34,
             });
             ctx.request_repaint();
         } else {
@@ -8976,19 +9360,6 @@ impl CrosshairApp {
 
         let elapsed = (ctx.input(|input| input.time) - animation.started_at).max(0.0);
         let progress = (elapsed / animation.duration_sec).clamp(0.0, 1.0) as f32;
-        let eased = 1.0 - (1.0 - progress).powi(3);
-        let end_size = Self::animation_min_size();
-        let new_size = vec2(
-            animation.start_inner_size.x
-                + (end_size.x - animation.start_inner_size.x) * eased,
-            animation.start_inner_size.y
-                + (end_size.y - animation.start_inner_size.y) * eased,
-        );
-        let center = animation.start_outer_rect.center();
-        let new_pos = center - new_size * 0.5;
-
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new_size));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
 
         if progress >= 1.0 {
             self.finish_close_to_tray_hide(ctx);
@@ -9008,17 +9379,16 @@ impl CrosshairApp {
         let end_center = end_outer_pos + end_inner_size * 0.5;
         let start_outer_pos = end_center - start_inner_size * 0.5;
 
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(start_inner_size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(start_outer_pos));
         self.open_from_tray_animation = Some(OpenFromTrayAnimation {
             start_outer_pos,
             start_inner_size,
             end_outer_pos,
             end_inner_size,
             started_at: ctx.input(|input| input.time),
-            duration_sec: 0.20,
+            duration_sec: 0.34,
         });
-
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(start_inner_size));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(start_outer_pos));
         ctx.request_repaint();
     }
 
@@ -9060,6 +9430,7 @@ impl CrosshairApp {
         self.state.show_window = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         let _ = self.overlay_tx.send(OverlayCommand::SetUiVisible(false));
+        crate::overlay::wake_command_queue();
         self.persist();
     }
 }
@@ -9069,14 +9440,31 @@ impl eframe::App for CrosshairApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if matches!(self.state.active_panel, AppPanel::Zoom | AppPanel::Modes) {
             self.state.active_panel = AppPanel::Pin;
         }
         self.apply_theme(ctx);
+        let wants_native_shadow = self.state.show_window
+            && self.startup_splash.duration_sec <= 0.0
+            && self.close_to_tray_animation.is_none()
+            && self.open_from_tray_animation.is_none();
+        if self.native_shadow_applied != wants_native_shadow {
+            crate::platform::set_native_window_shadow(frame, wants_native_shadow);
+            self.native_shadow_applied = wants_native_shadow;
+        }
         while let Ok(command) = self.ui_rx.try_recv() {
             match command {
                 UiCommand::ShowWindow => {
+                    if self.state.show_window || self.open_from_tray_animation.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Informational,
+                        ));
+                        continue;
+                    }
                     self.close_to_tray_animation = None;
                     self.open_from_tray_animation = None;
                     self.state.show_window = true;
@@ -9090,15 +9478,18 @@ impl eframe::App for CrosshairApp {
                         .hidden_window_outer_pos
                         .take()
                         .unwrap_or_else(|| Self::centered_outer_position_for_size(target_size));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    crate::platform::set_native_window_shadow(frame, false);
+                    self.native_shadow_applied = false;
                     self.center_window_next_frame = false;
                     self.begin_open_from_tray_animation(ctx, target_pos, target_size);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                         egui::UserAttentionType::Informational,
                     ));
                     let _ = self.overlay_tx.send(OverlayCommand::SetUiVisible(true));
+                    crate::overlay::wake_command_queue();
                     ctx.request_repaint();
                 }
                 UiCommand::Exit => {
@@ -9148,6 +9539,10 @@ impl eframe::App for CrosshairApp {
             self.update_open_from_tray_animation(ctx);
         }
 
+        if !self.state.show_window {
+            return;
+        }
+
         if self.center_window_next_frame && self.state.show_window {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Self::desired_window_size()));
             if let Some(center_cmd) = egui::ViewportCommand::center_on_screen(ctx) {
@@ -9181,11 +9576,27 @@ impl eframe::App for CrosshairApp {
 
         if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            crate::platform::set_native_window_shadow(frame, false);
+            self.native_shadow_applied = false;
             self.begin_close_to_tray_animation(ctx);
         }
 
         if let Some(progress) = self.startup_splash_progress(ctx) {
             self.render_startup_splash(ctx, progress);
+            return;
+        }
+
+        if let Some(animation) = &self.close_to_tray_animation {
+            let elapsed = (ctx.input(|input| input.time) - animation.started_at).max(0.0);
+            let progress = (elapsed / animation.duration_sec).clamp(0.0, 1.0) as f32;
+            self.render_tray_blob_transition(ctx, progress, false);
+            return;
+        }
+
+        if let Some(animation) = &self.open_from_tray_animation {
+            let elapsed = (ctx.input(|input| input.time) - animation.started_at).max(0.0);
+            let progress = (elapsed / animation.duration_sec).clamp(0.0, 1.0) as f32;
+            self.render_tray_blob_transition(ctx, progress, true);
             return;
         }
 
@@ -9304,12 +9715,6 @@ impl eframe::App for CrosshairApp {
                                     .inner_margin(egui::Margin::symmetric(12, 8))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("●")
-                                                    .color(accent)
-                                                    .size(13.0)
-                                                    .strong(),
-                                            );
                                             if self.state.ui_language == UiLanguage::Icon {
                                                 ui.label(Self::material_icon_text(0xe312, 22.0));
                                             } else {
@@ -9332,7 +9737,7 @@ impl eframe::App for CrosshairApp {
 
                         if drag_response.double_clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                        } else if drag_response.drag_started() || drag_response.dragged() {
+                        } else if drag_response.drag_started() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
                     },
@@ -9427,6 +9832,7 @@ impl eframe::App for CrosshairApp {
                     ui.label(RichText::new(&self.status).strong());
                 });
         });
+
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -9447,3 +9853,4 @@ fn audio_duration(clip: &AudioClipSettings) -> Option<u64> {
         audio::load_duration_ms(&clip.file_path).ok()
     }
 }
+
